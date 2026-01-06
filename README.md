@@ -39,6 +39,16 @@ Voir [`DESIGN_CORE.md`](DESIGN_CORE.md) pour le contrat technique, et [`SPRINT0_
 ```
 .
 ├── README.md
+├── rummy/
+│   ├── engine.py
+│   ├── cli.py
+│   ├── meld.py
+│   ├── move.py
+│   ├── multiset.py
+│   ├── rules.py
+│   ├── state.py
+│   ├── table.py
+│   └── tiles.py
 ├── roadmap.md
 ├── DESIGN_CORE.md
 ├── SPRINT0_SPEC.md
@@ -48,6 +58,19 @@ Voir [`DESIGN_CORE.md`](DESIGN_CORE.md) pour le contrat technique, et [`SPRINT0_
 ├── rl/
 └── tests/
 ```
+
+---
+
+## Sprint 1 — état actuel
+
+Le moteur core (Sprint 1) est opérationnel en Python :
+- `new_game(ruleset, rng_seed)` crée une partie déterministe (pioche ordonnée par seed).
+- `is_legal_move(state, move)` valide `DRAW`, `PASS` et `PLAY`.
+- `apply_move(state, move)` applique le coup, gère la pioche, les tours, l’historique et détecte la victoire (main vide).
+- `replay_event_log(initial_state, events)` rejoue un historique pour vérifier le déterminisme.
+- Un runner CLI minimal (`python -m rummy.cli --seed 123`) joue une partie automatique et affiche le vainqueur/état final.
+
+Tests (pytest) couvrent la pioche, la validation des melds, la conservation et la reproductibilité des replays.
 
 ---
 
