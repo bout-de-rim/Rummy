@@ -162,14 +162,15 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         slots.sort(key=lambda s: (s.effective_color() if s.tile_id != JOKER_ID else s.assigned_color or 0, s.effective_value()))
         return slots
 
-    def _slots_from_tile_ids(tile_ids: List[int]) -> List[TileSlot]:
+    def _slots_from_tile_ids(tile_ids: List[int], sort_slots: bool = False) -> List[TileSlot]:
         slots: List[TileSlot] = []
         for tile_id in tile_ids:
             if tile_id == JOKER_ID:
                 slots.append(TileSlot(JOKER_ID, assigned_color=0, assigned_value=1))
             else:
                 slots.append(TileSlot(tile_id))
-        slots.sort(key=lambda s: (s.effective_color() if s.tile_id != JOKER_ID else s.assigned_color or 0, s.effective_value()))
+        if sort_slots:
+            slots.sort(key=lambda s: (s.effective_color() if s.tile_id != JOKER_ID else s.assigned_color or 0, s.effective_value()))
         return slots
 
     color_palette = [
@@ -252,14 +253,26 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             pygame.draw.rect(screen, accent_color, rect.inflate(-4, -4), border_radius=6)
             segments.append((rect, 0))
             return segments
-        seg_w = max(6, (rect.width - 20) // len(timeline.history))
+        total = len(timeline.history)
+        gap = 2
+        available = rect.width - 20
+        seg_w = (available - gap * (total - 1)) // total
+        if seg_w < 2:
+            seg_w = 2
+            gap = 1
+            max_segments = max(1, (available + gap) // (seg_w + gap))
+            window = min(total, max_segments)
+            start = max(0, min(total - window, timeline.index - window // 2))
+            visible = range(start, start + window)
+        else:
+            visible = range(total)
         x = rect.x + 10
-        for idx in range(len(timeline.history)):
+        for idx in visible:
             seg_rect = pygame.Rect(x, rect.y + 6, seg_w, rect.height - 12)
             color = accent_color if idx == timeline.index else (90, 94, 110)
             pygame.draw.rect(screen, color, seg_rect, border_radius=4)
             segments.append((seg_rect, idx))
-            x += seg_w + 6
+            x += seg_w + gap
         return segments
 
     def _apply_move_and_refresh(move: Move, success_message: str) -> None:
@@ -391,7 +404,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         screen.blit(toggle_hint, (820, 450))
 
         if show_godmode:
-            god_panel = pygame.Rect(520, 190, 740, 280)
+            god_panel = pygame.Rect(520, 170, 740, 360)
             pygame.draw.rect(screen, panel_color, god_panel, border_radius=8)
             pygame.draw.rect(screen, accent_color, god_panel, width=2, border_radius=8)
 
@@ -399,7 +412,12 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             screen.blit(title, (god_panel.x + 12, god_panel.y + 8))
 
             y_cursor = god_panel.y + 40
+            y_limit = god_panel.bottom - 12
+            hidden_players = 0
             for idx, hand in enumerate(timeline.current.hands):
+                if y_cursor + 60 > y_limit:
+                    hidden_players = len(timeline.current.hands) - idx
+                    break
                 label = small_font.render(
                     f"P{idx + 1} hand ({hand.total()} tiles)" + ("  ← current" if idx == timeline.current.current_player else ""),
                     True,
@@ -411,11 +429,19 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 rows = (len(slots) + 14) // 15
                 y_cursor += 16 + rows * (44 + 8) + 6
 
+            if hidden_players:
+                hidden_label = small_font.render(f"+{hidden_players} player(s) hidden (panel limit)", True, text_color)
+                screen.blit(hidden_label, (god_panel.x + 12, y_cursor))
+                y_cursor += 18
+
             deck_remaining = timeline.current.deck_order[timeline.current.deck_index :]
-            deck_label = small_font.render(f"Deck remaining: {len(deck_remaining)} (top shown)", True, text_color)
-            screen.blit(deck_label, (god_panel.x + 12, y_cursor))
-            deck_slots = _slots_from_tile_ids(deck_remaining[:45])
-            _layout_hand_tiles(deck_slots, y_cursor + 16, per_row=15, tile_w=30, tile_h=42, start_x=god_panel.x + 12)
+            if y_cursor + 60 <= y_limit:
+                deck_label = small_font.render(f"Deck remaining: {len(deck_remaining)} (top shown)", True, text_color)
+                screen.blit(deck_label, (god_panel.x + 12, y_cursor))
+                max_rows = max(1, (y_limit - (y_cursor + 16)) // (42 + 8))
+                max_tiles = max_rows * 15
+                deck_slots = _slots_from_tile_ids(deck_remaining[:max_tiles])
+                _layout_hand_tiles(deck_slots, y_cursor + 16, per_row=15, tile_w=30, tile_h=42, start_x=god_panel.x + 12)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
