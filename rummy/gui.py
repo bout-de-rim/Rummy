@@ -162,6 +162,16 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         slots.sort(key=lambda s: (s.effective_color() if s.tile_id != JOKER_ID else s.assigned_color or 0, s.effective_value()))
         return slots
 
+    def _slots_from_tile_ids(tile_ids: List[int]) -> List[TileSlot]:
+        slots: List[TileSlot] = []
+        for tile_id in tile_ids:
+            if tile_id == JOKER_ID:
+                slots.append(TileSlot(JOKER_ID, assigned_color=0, assigned_value=1))
+            else:
+                slots.append(TileSlot(tile_id))
+        slots.sort(key=lambda s: (s.effective_color() if s.tile_id != JOKER_ID else s.assigned_color or 0, s.effective_value()))
+        return slots
+
     color_palette = [
         (214, 72, 72),
         (75, 139, 190),
@@ -404,7 +414,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             deck_remaining = timeline.current.deck_order[timeline.current.deck_index :]
             deck_label = small_font.render(f"Deck remaining: {len(deck_remaining)} (top shown)", True, text_color)
             screen.blit(deck_label, (god_panel.x + 12, y_cursor))
-            deck_slots = _slots_from_counts(deck_remaining[:45])
+            deck_slots = _slots_from_tile_ids(deck_remaining[:45])
             _layout_hand_tiles(deck_slots, y_cursor + 16, per_row=15, tile_w=30, tile_h=42, start_x=god_panel.x + 12)
 
         for event in pygame.event.get():
