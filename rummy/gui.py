@@ -144,11 +144,23 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     selected_slot: Optional[Tuple[int, int]] = None
     message = "Left click to drag tiles. Right click a joker to tweak its assignment." \
               " Use <-/-> to navigate the timeline."
+    show_godmode = False
 
     TILE_W, TILE_H = 50, 70
     TABLE_START_X = 30
     TABLE_START_Y = 80
     ROW_HEIGHT = TILE_H + 30
+
+    def _slots_from_counts(counts: List[int]) -> List[TileSlot]:
+        slots: List[TileSlot] = []
+        for tile_id, count in enumerate(counts):
+            for _ in range(count):
+                if tile_id == JOKER_ID:
+                    slots.append(TileSlot(JOKER_ID, assigned_color=0, assigned_value=1))
+                else:
+                    slots.append(TileSlot(tile_id))
+        slots.sort(key=lambda s: (s.effective_color() if s.tile_id != JOKER_ID else s.assigned_color or 0, s.effective_value()))
+        return slots
 
     color_palette = [
         (214, 72, 72),
@@ -186,15 +198,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
 
     def _visible_hand_slots() -> List[TileSlot]:
         remaining = remaining_hand_after_edit(timeline.current, edited_table)
-        slots: List[TileSlot] = []
-        for tile_id, count in enumerate(remaining.counts):
-            for _ in range(count):
-                if tile_id == JOKER_ID:
-                    slots.append(TileSlot(JOKER_ID, assigned_color=0, assigned_value=1))
-                else:
-                    slots.append(TileSlot(tile_id))
-        slots.sort(key=lambda s: (s.effective_color() if s.tile_id != JOKER_ID else s.assigned_color or 0, s.effective_value()))
-        return slots
+        return _slots_from_counts(remaining.counts)
 
     def _layout_table_tiles(start_x: int, start_y: int) -> List[Tuple[pygame.Rect, TileSlot, int, int]]:
         layout: List[Tuple[pygame.Rect, TileSlot, int, int]] = []
@@ -213,14 +217,20 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             y += ROW_HEIGHT
         return layout
 
-    def _layout_hand_tiles(slots: List[TileSlot], origin_y: int) -> List[Tuple[pygame.Rect, TileSlot]]:
+    def _layout_hand_tiles(
+        slots: List[TileSlot],
+        origin_y: int,
+        per_row: int = 18,
+        tile_w: int = TILE_W,
+        tile_h: int = TILE_H,
+        start_x: int = 30,
+    ) -> List[Tuple[pygame.Rect, TileSlot]]:
         hand_layout: List[Tuple[pygame.Rect, TileSlot]] = []
-        x, y = 30, origin_y
-        per_row = 18
+        x, y = start_x, origin_y
         for idx, slot in enumerate(slots):
             row = idx // per_row
             col = idx % per_row
-            rect = pygame.Rect(x + col * (TILE_W + 6), y + row * (TILE_H + 8), TILE_W, TILE_H)
+            rect = pygame.Rect(x + col * (tile_w + 6), y + row * (tile_h + 8), tile_w, tile_h)
             _draw_tile(screen, rect, slot)
             hand_layout.append((rect, slot))
         return hand_layout
@@ -367,12 +377,45 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         msg_surface = small_font.render(message, True, text_color)
         screen.blit(msg_surface, (20, 730))
 
+        toggle_hint = small_font.render("Press 'G' to toggle godmode (show all hands & deck)", True, text_color)
+        screen.blit(toggle_hint, (820, 450))
+
+        if show_godmode:
+            god_panel = pygame.Rect(520, 190, 740, 280)
+            pygame.draw.rect(screen, panel_color, god_panel, border_radius=8)
+            pygame.draw.rect(screen, accent_color, god_panel, width=2, border_radius=8)
+
+            title = font.render("Godmode — full visibility", True, text_color)
+            screen.blit(title, (god_panel.x + 12, god_panel.y + 8))
+
+            y_cursor = god_panel.y + 40
+            for idx, hand in enumerate(timeline.current.hands):
+                label = small_font.render(
+                    f"P{idx + 1} hand ({hand.total()} tiles)" + ("  ← current" if idx == timeline.current.current_player else ""),
+                    True,
+                    text_color,
+                )
+                screen.blit(label, (god_panel.x + 12, y_cursor))
+                slots = _slots_from_counts(hand.counts)
+                _layout_hand_tiles(slots, y_cursor + 16, per_row=15, tile_w=32, tile_h=44, start_x=god_panel.x + 12)
+                rows = (len(slots) + 14) // 15
+                y_cursor += 16 + rows * (44 + 8) + 6
+
+            deck_remaining = timeline.current.deck_order[timeline.current.deck_index :]
+            deck_label = small_font.render(f"Deck remaining: {len(deck_remaining)} (top shown)", True, text_color)
+            screen.blit(deck_label, (god_panel.x + 12, y_cursor))
+            deck_slots = _slots_from_counts(deck_remaining[:45])
+            _layout_hand_tiles(deck_slots, y_cursor + 16, per_row=15, tile_w=30, tile_h=42, start_x=god_panel.x + 12)
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
+                elif event.key == pygame.K_g:
+                    show_godmode = not show_godmode
+                    message = "Godmode enabled" if show_godmode else "Godmode hidden"
                 elif event.key == pygame.K_LEFT:
                     timeline.jump(timeline.index - 1)
                     edited_table = timeline.current.table.canonicalize()
