@@ -56,7 +56,8 @@ def compute_delta_from_tables(base_table: Table, edited_table: Table) -> Tuple[O
 def build_play_move(state: GameState, edited_table: Table) -> Tuple[Optional[Move], str]:
     """Compute a PLAY move for the current player based on the edited table."""
 
-    canonical_table, error = _safe_canonical_table(edited_table)
+    non_empty = Table([meld for meld in edited_table.melds if meld.slots])
+    canonical_table, error = _safe_canonical_table(non_empty)
     if canonical_table is None:
         return None, error
 
@@ -81,7 +82,8 @@ def remaining_hand_after_edit(state: GameState, edited_table: Table) -> TileMult
     intended for UI rendering only.
     """
 
-    canonical_table, error = _safe_canonical_table(edited_table)
+    non_empty = Table([meld for meld in edited_table.melds if meld.slots])
+    canonical_table, error = _safe_canonical_table(non_empty)
     if canonical_table is None:
         return state.hands[state.current_player].copy()
 
@@ -262,6 +264,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             return [0] * len(timeline.current.hands[0].counts)
         return list(delta.counts)
 
+    def _can_remove_from_hand(slot: TileSlot) -> bool:
+        counts = _build_added_tile_counts()
+        return counts[slot.tile_id] > 0
+
     def _mark_modified_melds() -> List[bool]:
         from collections import Counter
 
@@ -374,7 +380,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 return False
             min_val = min(values)
             max_val = max(values)
-            return (max_val - min_val + 1) <= timeline.current.ruleset.values
+            if (max_val - min_val + 1) != len(values):
+                return False
+            return max_val <= timeline.current.ruleset.values and min_val >= 1
         return False
 
     def _choose_kind_for_slots(slots: List[TileSlot], preferred: Optional[MeldKind]) -> Optional[MeldKind]:
@@ -444,6 +452,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         tile_w: int = TILE_W,
         tile_h: int = TILE_H,
         start_x: int = 30,
+        highlight_hand: bool = False,
     ) -> List[Tuple[pygame.Rect, TileSlot]]:
         hand_layout: List[Tuple[pygame.Rect, TileSlot]] = []
         x, y = start_x, origin_y
@@ -452,6 +461,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             col = idx % per_row
             rect = pygame.Rect(x + col * (tile_w + 6), y + row * (tile_h + 8), tile_w, tile_h)
             _draw_tile(screen, rect, slot)
+            if highlight_hand:
+                pygame.draw.rect(screen, (255, 196, 72), rect, width=3, border_radius=6)
             hand_layout.append((rect, slot))
         return hand_layout
 
@@ -545,7 +556,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             TABLE_START_X, TABLE_START_Y, added_counts, modified_flags
         )
         hand_slots = _visible_hand_slots()
-        hand_tiles = _layout_hand_tiles(hand_slots, 520)
+        hand_tiles = _layout_hand_tiles(hand_slots, 520, highlight_hand=True)
 
         # Buttons (recomputed each frame for enabled state)
         buttons: List[Tuple[pygame.Rect, str, Callable[[], None], bool]] = []
@@ -832,16 +843,21 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                                         meld_idx, position = selected_empty_slot
                                         placed = _try_insert_into_meld(meld_idx, slot, position)
                                         if placed:
-                                            selected_empty_slot = None
+                                            pass
                                         break
                                     carried = slot
                                     carried_from = ("hand", -1, -1)
                                     break
                 elif event.button == 3:
-                    # Right click selects tile for assignment tweaks
+                    # Right click selects tile for assignment tweaks or returns hand tile
                     for rect, slot, meld_idx, slot_idx in table_tiles:
                         if rect.collidepoint(event.pos):
-                            selected_slot = (meld_idx, slot_idx)
+                            if timeline.at_end() and _can_remove_from_hand(slot):
+                                edited_table.melds[meld_idx].slots.pop(slot_idx)
+                                _remove_empty_melds(edited_table)
+                                message = "Returned tile to hand"
+                            else:
+                                selected_slot = (meld_idx, slot_idx)
                             break
                 elif event.button in (4, 5):
                     if show_godmode and god_panel.collidepoint(event.pos):
