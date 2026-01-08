@@ -172,6 +172,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     TABLE_START_Y = 80
     ROW_HEIGHT = TILE_H + 30
     HAND_AREA = pygame.Rect(20, 520, 1240, 200)
+    STATUS_BAR_HEIGHT = 28
 
     def _slots_from_counts(counts: List[int]) -> List[TileSlot]:
         slots: List[TileSlot] = []
@@ -265,6 +266,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             return [0] * len(timeline.current.hands[0].counts)
         return list(delta.counts)
 
+    def _is_draft_active() -> bool:
+        return any(_build_added_tile_counts()) or any(_mark_modified_melds())
+
     def _can_remove_from_hand(slot: TileSlot) -> bool:
         counts = _build_added_tile_counts()
         return counts[slot.tile_id] > 0
@@ -327,7 +331,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             x = start_x
             y += ROW_HEIGHT
         for rect, meld_idx, position in empty_slots:
-            color = accent_color if selected_empty_slot == (meld_idx, position) else (120, 126, 138)
+            is_selected = selected_empty_slot == (meld_idx, position)
+            color = accent_color if is_selected else (120, 126, 138)
             pygame.draw.rect(screen, color, rect, width=2, border_radius=6)
             ghost = rect.inflate(-10, -10)
             pygame.draw.rect(screen, (46, 50, 60), ghost, border_radius=4)
@@ -552,7 +557,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         screen.blit(table_title, (20, 20))
 
         meld_count = max(1, len(edited_table.melds))
-        HAND_AREA = pygame.Rect(20, screen_h - max(160, int(screen_h * 0.28)), screen_w - 40, max(160, int(screen_h * 0.28)) - 20)
+        status_bar = pygame.Rect(10, screen_h - STATUS_BAR_HEIGHT - 6, screen_w - 20, STATUS_BAR_HEIGHT)
+        hand_height = max(160, int(screen_h * 0.28))
+        HAND_AREA = pygame.Rect(20, screen_h - hand_height - STATUS_BAR_HEIGHT - 10, screen_w - 40, hand_height - 10)
         timeline_y = HAND_AREA.y - 50
         TABLE_START_X = 30
         TABLE_START_Y = 80
@@ -571,6 +578,11 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         hand_slots = _visible_hand_slots()
         per_row = max(1, (HAND_AREA.width - 20) // (TILE_W + 6))
         hand_tiles = _layout_hand_tiles(hand_slots, HAND_AREA.y + 10, per_row=per_row, highlight_hand=True)
+
+        if carried is not None:
+            for rect, _, _ in empty_slots:
+                pygame.draw.rect(screen, accent_color, rect, width=2, border_radius=6)
+            pygame.draw.rect(screen, accent_color, HAND_AREA, width=2, border_radius=6)
 
         # Buttons (recomputed each frame for enabled state)
         buttons: List[Tuple[pygame.Rect, str, Callable[[], None], bool]] = []
@@ -592,8 +604,13 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             selected_empty_slot = None
             message = "Draft reset to current state"
 
+        def _add_meld() -> None:
+            edited_table.melds.append(Meld(MeldKind.RUN, []))
+            _ensure_empty_meld(edited_table)
+
         can_play = timeline.at_end()
-        add_button(700, 30, "Reset draft", _reset_draft, can_play)
+        add_button(520, 30, "+ Meld", _add_meld, can_play)
+        add_button(700, 30, "Reset draft", _reset_draft, can_play and _is_draft_active())
 
         def _on_validate() -> None:
             nonlocal message
@@ -637,8 +654,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         )
         screen.blit(info_text, (20, timeline_y - 20))
 
+        pygame.draw.rect(screen, panel_color, status_bar, border_radius=6)
         msg_surface = small_font.render(message, True, text_color)
-        screen.blit(msg_surface, (20, screen_h - 30))
+        screen.blit(msg_surface, (status_bar.x + 10, status_bar.y + 6))
 
         toggle_hint = small_font.render("Press 'G' to toggle godmode (show all hands & deck)", True, text_color)
         screen.blit(toggle_hint, (max(20, screen_w - 420), timeline_y - 20))
@@ -687,6 +705,12 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             max_scroll = max(0, content_height - visible_height)
             if godmode_scroll > max_scroll:
                 godmode_scroll = max_scroll
+
+        if _is_draft_active():
+            draft_rect = pygame.Rect(20, 50, 140, 20)
+            pygame.draw.rect(screen, (255, 196, 72), draft_rect, border_radius=6)
+            draft_label = small_font.render("Draft in progress", True, (20, 20, 20))
+            screen.blit(draft_label, (draft_rect.x + 6, draft_rect.y + 2))
 
         if screenshot_path and not screenshot_taken:
             screenshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -871,6 +895,13 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                                 message = "Returned tile to hand"
                             else:
                                 selected_slot = (meld_idx, slot_idx)
+                            break
+                    for slot_rect, meld_idx, position in empty_slots:
+                        if slot_rect.collidepoint(event.pos):
+                            if position == "only" and not edited_table.melds[meld_idx].slots:
+                                edited_table.melds.pop(meld_idx)
+                                _ensure_empty_meld(edited_table)
+                                message = "Empty meld removed"
                             break
                 elif event.button in (4, 5):
                     if show_godmode and god_panel.collidepoint(event.pos):
