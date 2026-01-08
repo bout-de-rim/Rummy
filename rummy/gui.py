@@ -145,6 +145,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     message = "Left click to drag tiles. Right click a joker to tweak its assignment." \
               " Use <-/-> to navigate the timeline."
     show_godmode = False
+    godmode_scroll = 0
 
     TILE_W, TILE_H = 50, 70
     TABLE_START_X = 30
@@ -403,21 +404,25 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         toggle_hint = small_font.render("Press 'G' to toggle godmode (show all hands & deck)", True, text_color)
         screen.blit(toggle_hint, (820, 450))
 
+        god_panel = pygame.Rect(0, 0, 0, 0)
         if show_godmode:
-            god_panel = pygame.Rect(520, 170, 740, 360)
+            god_panel = pygame.Rect(520, 150, 740, 380)
             pygame.draw.rect(screen, panel_color, god_panel, border_radius=8)
             pygame.draw.rect(screen, accent_color, god_panel, width=2, border_radius=8)
 
             title = font.render("Godmode — full visibility", True, text_color)
             screen.blit(title, (god_panel.x + 12, god_panel.y + 8))
 
-            y_cursor = god_panel.y + 40
-            y_limit = god_panel.bottom - 12
-            hidden_players = 0
+            hint = small_font.render("Scroll: mouse wheel / PgUp PgDn", True, text_color)
+            screen.blit(hint, (god_panel.x + 12, god_panel.y + 26))
+
+            y_cursor = god_panel.y + 48 - godmode_scroll
+            clip_rect = god_panel.inflate(-16, -16)
+            clip_rect.y += 24
+            clip_rect.height -= 24
+            screen.set_clip(clip_rect)
+            content_start = y_cursor
             for idx, hand in enumerate(timeline.current.hands):
-                if y_cursor + 60 > y_limit:
-                    hidden_players = len(timeline.current.hands) - idx
-                    break
                 label = small_font.render(
                     f"P{idx + 1} hand ({hand.total()} tiles)" + ("  ← current" if idx == timeline.current.current_player else ""),
                     True,
@@ -429,19 +434,20 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 rows = (len(slots) + 14) // 15
                 y_cursor += 16 + rows * (44 + 8) + 6
 
-            if hidden_players:
-                hidden_label = small_font.render(f"+{hidden_players} player(s) hidden (panel limit)", True, text_color)
-                screen.blit(hidden_label, (god_panel.x + 12, y_cursor))
-                y_cursor += 18
-
             deck_remaining = timeline.current.deck_order[timeline.current.deck_index :]
-            if y_cursor + 60 <= y_limit:
-                deck_label = small_font.render(f"Deck remaining: {len(deck_remaining)} (top shown)", True, text_color)
-                screen.blit(deck_label, (god_panel.x + 12, y_cursor))
-                max_rows = max(1, (y_limit - (y_cursor + 16)) // (42 + 8))
-                max_tiles = max_rows * 15
-                deck_slots = _slots_from_tile_ids(deck_remaining[:max_tiles])
-                _layout_hand_tiles(deck_slots, y_cursor + 16, per_row=15, tile_w=30, tile_h=42, start_x=god_panel.x + 12)
+            deck_label = small_font.render(f"Deck remaining: {len(deck_remaining)} (top 15 shown)", True, text_color)
+            screen.blit(deck_label, (god_panel.x + 12, y_cursor))
+            deck_preview = deck_remaining[:15]
+            deck_slots = _slots_from_tile_ids(deck_preview)
+            _layout_hand_tiles(deck_slots, y_cursor + 16, per_row=15, tile_w=30, tile_h=42, start_x=god_panel.x + 12)
+            y_cursor += 16 + (42 + 8) + 6
+
+            content_height = y_cursor - content_start
+            screen.set_clip(None)
+            visible_height = clip_rect.height
+            max_scroll = max(0, content_height - visible_height)
+            if godmode_scroll > max_scroll:
+                godmode_scroll = max_scroll
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -452,6 +458,14 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 elif event.key == pygame.K_g:
                     show_godmode = not show_godmode
                     message = "Godmode enabled" if show_godmode else "Godmode hidden"
+                    if not show_godmode:
+                        godmode_scroll = 0
+                elif event.key == pygame.K_PAGEUP:
+                    if show_godmode:
+                        godmode_scroll = max(0, godmode_scroll - 120)
+                elif event.key == pygame.K_PAGEDOWN:
+                    if show_godmode:
+                        godmode_scroll += 120
                 elif event.key == pygame.K_LEFT:
                     timeline.jump(timeline.index - 1)
                     edited_table = timeline.current.table.canonicalize()
@@ -513,6 +527,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         if rect.collidepoint(event.pos):
                             selected_slot = (meld_idx, slot_idx)
                             break
+                elif event.button in (4, 5):
+                    if show_godmode and god_panel.collidepoint(event.pos):
+                        delta = -40 if event.button == 4 else 40
+                        godmode_scroll = max(0, godmode_scroll + delta)
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1 and carried is not None:
                     _handle_drop(event.pos, table_tiles, hand_tiles)
