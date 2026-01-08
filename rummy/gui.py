@@ -155,13 +155,15 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     carried: Optional[TileSlot] = None
     carried_from: Optional[Tuple[str, int, int]] = None  # ("table"/"hand", meld_idx, slot_idx)
     selected_slot: Optional[Tuple[int, int]] = None
-    selected_meld_end: Optional[Tuple[int, str]] = None  # (meld_idx, "left"/"right")
+    selected_empty_slot: Optional[Tuple[int, str]] = None  # (meld_idx, "before"/"after"/"only")
     message = "Left click to drag tiles. Right click a joker to tweak its assignment." \
               " Use <-/-> to navigate the timeline."
     show_godmode = False
     godmode_scroll = 0
     screenshot_path = resolve_screenshot_path()
     screenshot_taken = False
+    modal_open = False
+    modal_page = 0
 
     TILE_W, TILE_H = 50, 70
     TABLE_START_X = 30
@@ -228,30 +230,101 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         remaining = remaining_hand_after_edit(timeline.current, edited_table)
         return _slots_from_counts(remaining.counts)
 
+    def _ensure_empty_meld(table: Table) -> None:
+        empty_indices = [idx for idx, meld in enumerate(table.melds) if not meld.slots]
+        if not empty_indices:
+            table.melds.append(Meld(MeldKind.RUN, []))
+        elif len(empty_indices) > 1:
+            for idx in reversed(empty_indices[1:]):
+                table.melds.pop(idx)
+
+    def _meld_empty_slots(meld: Meld) -> List[str]:
+        if not meld.slots:
+            return ["only"]
+        if meld.kind == MeldKind.RUN:
+            values = [slot.effective_value() for slot in meld.slots]
+            min_val = min(values)
+            max_val = max(values)
+            slots: List[str] = []
+            if min_val > 1:
+                slots.append("before")
+            if max_val < timeline.current.ruleset.values:
+                slots.append("after")
+            return slots
+        if meld.kind == MeldKind.GROUP:
+            return ["after"] if len(meld.slots) < 4 else []
+        return []
+
+    def _build_added_tile_counts() -> List[int]:
+        edited_non_empty = Table([meld for meld in edited_table.melds if meld.slots])
+        delta, _ = compute_delta_from_tables(timeline.current.table.canonicalize(), edited_non_empty.canonicalize())
+        if delta is None:
+            return [0] * len(timeline.current.hands[0].counts)
+        return list(delta.counts)
+
+    def _mark_modified_melds() -> List[bool]:
+        from collections import Counter
+
+        base_melds = timeline.current.table.canonicalize().melds
+        base_counter = Counter(m.effective_signature() for m in base_melds)
+        modified_flags: List[bool] = []
+        for meld in edited_table.melds:
+            if not meld.slots:
+                modified_flags.append(True)
+                continue
+            sig = meld.effective_signature()
+            if base_counter[sig] > 0:
+                base_counter[sig] -= 1
+                modified_flags.append(False)
+            else:
+                modified_flags.append(True)
+        return modified_flags
+
     def _layout_table_tiles(
-        start_x: int, start_y: int
-    ) -> Tuple[List[Tuple[pygame.Rect, TileSlot, int, int]], List[Tuple[pygame.Rect, int]]]:
+        start_x: int, start_y: int, added_counts: List[int], modified_flags: List[bool]
+    ) -> Tuple[List[Tuple[pygame.Rect, TileSlot, int, int]], List[Tuple[pygame.Rect, int, str]]]:
         layout: List[Tuple[pygame.Rect, TileSlot, int, int]] = []
-        headers: List[Tuple[pygame.Rect, int]] = []
+        empty_slots: List[Tuple[pygame.Rect, int, str]] = []
         x, y = start_x, start_y
         for meld_idx, meld in enumerate(edited_table.melds):
             header_rect = pygame.Rect(TABLE_START_X - 10, y - 20, 900, 18)
-            pygame.draw.rect(screen, panel_color, header_rect)
+            header_color = (63, 78, 112) if modified_flags[meld_idx] else panel_color
+            pygame.draw.rect(screen, header_color, header_rect)
             end_hint = ""
-            if selected_meld_end and selected_meld_end[0] == meld_idx:
-                end_hint = " [L]" if selected_meld_end[1] == "left" else " [R]"
+            if selected_empty_slot and selected_empty_slot[0] == meld_idx:
+                end_hint = f" [{selected_empty_slot[1][0].upper()}]"
             kind_label = meld.kind.value if meld.slots else "MELD"
             header_label = small_font.render(f"{kind_label} #{meld_idx+1}{end_hint}", True, text_color)
             screen.blit(header_label, (header_rect.x + 4, header_rect.y + 1))
-            headers.append((header_rect, meld_idx))
+            available_slots = _meld_empty_slots(meld)
             for slot_idx, slot in enumerate(meld.slots):
                 rect = pygame.Rect(x, y, TILE_W, TILE_H)
+                from_hand = False
+                if added_counts[slot.tile_id] > 0:
+                    added_counts[slot.tile_id] -= 1
+                    from_hand = True
                 _draw_tile(screen, rect, slot, highlight=selected_slot == (meld_idx, slot_idx))
+                if from_hand:
+                    pygame.draw.rect(screen, (255, 196, 72), rect, width=3, border_radius=6)
                 layout.append((rect, slot, meld_idx, slot_idx))
                 x += TILE_W + 8
+            if "before" in available_slots:
+                slot_rect = pygame.Rect(start_x - (TILE_W + 8), y, TILE_W, TILE_H)
+                empty_slots.append((slot_rect, meld_idx, "before"))
+            if "only" in available_slots:
+                slot_rect = pygame.Rect(start_x, y, TILE_W, TILE_H)
+                empty_slots.append((slot_rect, meld_idx, "only"))
+            if "after" in available_slots:
+                slot_rect = pygame.Rect(x, y, TILE_W, TILE_H)
+                empty_slots.append((slot_rect, meld_idx, "after"))
             x = start_x
             y += ROW_HEIGHT
-        return layout, headers
+        for rect, meld_idx, position in empty_slots:
+            color = accent_color if selected_empty_slot == (meld_idx, position) else (120, 126, 138)
+            pygame.draw.rect(screen, color, rect, width=2, border_radius=6)
+            ghost = rect.inflate(-10, -10)
+            pygame.draw.rect(screen, (46, 50, 60), ghost, border_radius=4)
+        return layout, empty_slots
 
     def _assign_joker_for_meld(slot: TileSlot, meld: Meld, to_left: bool, kind: MeldKind) -> Optional[TileSlot]:
         if slot.tile_id != JOKER_ID:
@@ -323,11 +396,15 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             return MeldKind.RUN
         return possible[0]
 
-    def _try_insert_into_meld(meld_idx: int, slot: TileSlot, to_left: bool) -> bool:
-        nonlocal message, selected_slot
+    def _try_insert_into_meld(meld_idx: int, slot: TileSlot, position: str) -> bool:
+        nonlocal message, selected_slot, selected_empty_slot
         if meld_idx < 0 or meld_idx >= len(edited_table.melds):
             return False
         meld = edited_table.melds[meld_idx]
+        if position == "only":
+            to_left = False
+        else:
+            to_left = position == "before"
         preferred_kind = meld.kind if meld.slots else None
         for kind in (preferred_kind, MeldKind.RUN, MeldKind.GROUP):
             if kind is None:
@@ -349,6 +426,13 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 continue
             edited_table.melds[meld_idx] = Meld(chosen_kind, new_slots)
             selected_slot = (meld_idx, new_slot_idx)
+            available = _meld_empty_slots(edited_table.melds[meld_idx])
+            if available:
+                preferred = "before" if position in ("before", "only") else "after"
+                if preferred in available:
+                    selected_empty_slot = (meld_idx, preferred)
+                else:
+                    selected_empty_slot = (meld_idx, available[0])
             return True
         message = "Cannot extend meld with this tile"
         return False
@@ -371,26 +455,28 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             hand_layout.append((rect, slot))
         return hand_layout
 
-    def _render_timeline_bar(rect: pygame.Rect) -> List[Tuple[pygame.Rect, int]]:
+    def _render_timeline_bar(rect: pygame.Rect) -> Tuple[List[Tuple[pygame.Rect, int]], Optional[pygame.Rect]]:
         pygame.draw.rect(screen, panel_color, rect, border_radius=6)
         segments: List[Tuple[pygame.Rect, int]] = []
+        ellipsis_rect: Optional[pygame.Rect] = None
         if len(timeline.history) == 1:
             pygame.draw.rect(screen, accent_color, rect.inflate(-4, -4), border_radius=6)
             segments.append((rect, 0))
-            return segments
+            return segments, ellipsis_rect
         total = len(timeline.history)
-        gap = 2
+        visible_count = 10
+        gap = 4
         available = rect.width - 20
-        seg_w = (available - gap * (total - 1)) // total
-        if seg_w < 2:
-            seg_w = 2
-            gap = 1
-            max_segments = max(1, (available + gap) // (seg_w + gap))
-            window = min(total, max_segments)
-            start = max(0, min(total - window, timeline.index - window // 2))
-            visible = range(start, start + window)
-        else:
+        seg_w = (available - gap * (visible_count - 1)) // visible_count
+        if total <= visible_count:
             visible = range(total)
+        else:
+            visible = range(total - visible_count, total)
+            ellipsis_rect = pygame.Rect(rect.x + rect.width - 34, rect.y + 4, 28, rect.height - 8)
+            pygame.draw.rect(screen, panel_color, ellipsis_rect, border_radius=6)
+            pygame.draw.rect(screen, accent_color, ellipsis_rect, width=2, border_radius=6)
+            dots = small_font.render("...", True, text_color)
+            screen.blit(dots, dots.get_rect(center=ellipsis_rect.center))
         x = rect.x + 10
         for idx in visible:
             seg_rect = pygame.Rect(x, rect.y + 6, seg_w, rect.height - 12)
@@ -398,13 +484,14 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             pygame.draw.rect(screen, color, seg_rect, border_radius=4)
             segments.append((seg_rect, idx))
             x += seg_w + gap
-        return segments
+        return segments, ellipsis_rect
 
     def _apply_move_and_refresh(move: Move, success_message: str) -> None:
-        nonlocal edited_table, message
+        nonlocal edited_table, message, selected_empty_slot
         next_state = apply_move(timeline.current, move)
         timeline.append(next_state)
         edited_table = next_state.table.canonicalize()
+        selected_empty_slot = None
         message = success_message
 
     def _handle_drop(pos: Tuple[int, int], table_layout, hand_layout) -> None:
@@ -450,8 +537,13 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         table_title = font.render("Table (drag/drop to rearrange)", True, text_color)
         screen.blit(table_title, (20, 20))
 
+        _ensure_empty_meld(edited_table)
+        added_counts = _build_added_tile_counts()
+        modified_flags = _mark_modified_melds()
         # Layout drawing pass also gives us hit boxes
-        table_tiles, table_headers = _layout_table_tiles(TABLE_START_X, TABLE_START_Y)
+        table_tiles, empty_slots = _layout_table_tiles(
+            TABLE_START_X, TABLE_START_Y, added_counts, modified_flags
+        )
         hand_slots = _visible_hand_slots()
         hand_tiles = _layout_hand_tiles(hand_slots, 520)
 
@@ -471,11 +563,12 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         add_button(700, 30, "Add GROUP", lambda: edited_table.melds.append(Meld(MeldKind.GROUP, [])), can_play)
 
         def _reset_draft() -> None:
-            nonlocal edited_table, carried, carried_from, selected_slot, message
+            nonlocal edited_table, carried, carried_from, selected_slot, selected_empty_slot, message
             edited_table = timeline.current.table.canonicalize()
             carried = None
             carried_from = None
             selected_slot = None
+            selected_empty_slot = None
             message = "Draft reset to current state"
 
         add_button(880, 30, "Reset draft", _reset_draft, can_play)
@@ -513,7 +606,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         add_button(1060, 130, "Pass", _on_pass, can_play)
 
         timeline_rect = pygame.Rect(20, 470, 1240, 36)
-        segments = _render_timeline_bar(timeline_rect)
+        segments, ellipsis_rect = _render_timeline_bar(timeline_rect)
 
         info_text = small_font.render(
             f"Player {timeline.current.current_player + 1} | Turn {timeline.current.turn_number} | Deck remaining: {len(timeline.current.deck_order) - timeline.current.deck_index}",
@@ -578,18 +671,64 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             pygame.image.save(screen, str(screenshot_path))
             screenshot_taken = True
 
+        if modal_open:
+            overlay = pygame.Surface((1280, 768), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 160))
+            screen.blit(overlay, (0, 0))
+            modal_rect = pygame.Rect(200, 140, 880, 500)
+            pygame.draw.rect(screen, panel_color, modal_rect, border_radius=8)
+            pygame.draw.rect(screen, accent_color, modal_rect, width=2, border_radius=8)
+            title = font.render("Select a previous turn", True, text_color)
+            screen.blit(title, (modal_rect.x + 16, modal_rect.y + 12))
+
+            page_size = 20
+            total_pages = max(1, (len(timeline.history) + page_size - 1) // page_size)
+            modal_page = max(0, min(modal_page, total_pages - 1))
+            start = modal_page * page_size
+            end = min(len(timeline.history), start + page_size)
+            y_cursor = modal_rect.y + 50
+            buttons_modal: List[Tuple[pygame.Rect, int]] = []
+            for idx in range(start, end):
+                rect = pygame.Rect(modal_rect.x + 20, y_cursor, 840, 22)
+                color = accent_color if idx == timeline.index else (90, 94, 110)
+                pygame.draw.rect(screen, color, rect, border_radius=4)
+                label = small_font.render(f"Turn {idx}", True, text_color)
+                screen.blit(label, (rect.x + 8, rect.y + 3))
+                buttons_modal.append((rect, idx))
+                y_cursor += 26
+
+            prev_rect = pygame.Rect(modal_rect.x + 20, modal_rect.bottom - 40, 80, 26)
+            next_rect = pygame.Rect(modal_rect.right - 100, modal_rect.bottom - 40, 80, 26)
+            close_rect = pygame.Rect(modal_rect.right - 100, modal_rect.y + 12, 80, 24)
+            pygame.draw.rect(screen, panel_color, prev_rect, border_radius=4)
+            pygame.draw.rect(screen, accent_color, prev_rect, width=2, border_radius=4)
+            pygame.draw.rect(screen, panel_color, next_rect, border_radius=4)
+            pygame.draw.rect(screen, accent_color, next_rect, width=2, border_radius=4)
+            pygame.draw.rect(screen, panel_color, close_rect, border_radius=4)
+            pygame.draw.rect(screen, accent_color, close_rect, width=2, border_radius=4)
+            screen.blit(small_font.render("Prev", True, text_color), small_font.render("Prev", True, text_color).get_rect(center=prev_rect.center))
+            screen.blit(small_font.render("Next", True, text_color), small_font.render("Next", True, text_color).get_rect(center=next_rect.center))
+            screen.blit(small_font.render("Close", True, text_color), small_font.render("Close", True, text_color).get_rect(center=close_rect.center))
+        else:
+            buttons_modal = []
+            modal_rect = pygame.Rect(0, 0, 0, 0)
+            prev_rect = next_rect = close_rect = pygame.Rect(0, 0, 0, 0)
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    running = False
+                    if modal_open:
+                        modal_open = False
+                    else:
+                        running = False
                 elif event.key == pygame.K_g:
                     show_godmode = not show_godmode
                     message = "Godmode enabled" if show_godmode else "Godmode hidden"
                     if not show_godmode:
                         godmode_scroll = 0
-                        selected_meld_end = None
+                        selected_empty_slot = None
                 elif event.key == pygame.K_PAGEUP:
                     if show_godmode:
                         godmode_scroll = max(0, godmode_scroll - 120)
@@ -600,13 +739,13 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                     timeline.jump(timeline.index - 1)
                     edited_table = timeline.current.table.canonicalize()
                     selected_slot = None
-                    selected_meld_end = None
+                    selected_empty_slot = None
                     message = ""
                 elif event.key == pygame.K_RIGHT:
                     timeline.jump(timeline.index + 1)
                     edited_table = timeline.current.table.canonicalize()
                     selected_slot = None
-                    selected_meld_end = None
+                    selected_empty_slot = None
                     message = ""
                 elif event.key in (pygame.K_c, pygame.K_v):
                     if selected_slot and selected_slot[0] < len(edited_table.melds):
@@ -627,8 +766,30 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         screenshot_path.parent.mkdir(parents=True, exist_ok=True)
                         pygame.image.save(screen, str(screenshot_path))
                         message = f"Screenshot saved to {screenshot_path}"
+                elif event.key == pygame.K_PERIOD and ellipsis_rect:
+                    modal_open = True
+                    modal_page = 0
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
+                    if modal_open:
+                        if close_rect.collidepoint(event.pos):
+                            modal_open = False
+                            continue
+                        if prev_rect.collidepoint(event.pos):
+                            modal_page = max(0, modal_page - 1)
+                            continue
+                        if next_rect.collidepoint(event.pos):
+                            modal_page += 1
+                            continue
+                        for rect, idx in buttons_modal:
+                            if rect.collidepoint(event.pos):
+                                timeline.jump(idx)
+                                edited_table = timeline.current.table.canonicalize()
+                                selected_slot = None
+                                selected_empty_slot = None
+                                modal_open = False
+                                break
+                        continue
                     # Buttons
                     for rect, label, handler, enabled in buttons:
                         if enabled and rect.collidepoint(event.pos):
@@ -640,14 +801,16 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             edited_table = timeline.current.table.canonicalize()
                             message = ""
                             break
+                    if ellipsis_rect and ellipsis_rect.collidepoint(event.pos):
+                        modal_open = True
+                        modal_page = 0
                     # Meld end selection
-                    for header_rect, meld_idx in table_headers:
-                        if header_rect.collidepoint(event.pos):
-                            side = "left" if event.pos[0] < header_rect.centerx else "right"
-                            if selected_meld_end == (meld_idx, side):
-                                selected_meld_end = None
+                    for slot_rect, meld_idx, position in empty_slots:
+                        if slot_rect.collidepoint(event.pos):
+                            if selected_empty_slot == (meld_idx, position):
+                                selected_empty_slot = None
                             else:
-                                selected_meld_end = (meld_idx, side)
+                                selected_empty_slot = (meld_idx, position)
                             break
 
                     # Drag start from table
@@ -665,11 +828,11 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         if carried is None:
                             for rect, slot in hand_tiles:
                                 if rect.collidepoint(event.pos):
-                                    if selected_meld_end and timeline.at_end():
-                                        meld_idx, side = selected_meld_end
-                                        placed = _try_insert_into_meld(meld_idx, slot, side == "left")
+                                    if selected_empty_slot and timeline.at_end():
+                                        meld_idx, position = selected_empty_slot
+                                        placed = _try_insert_into_meld(meld_idx, slot, position)
                                         if placed:
-                                            selected_meld_end = None
+                                            selected_empty_slot = None
                                         break
                                     carried = slot
                                     carried_from = ("hand", -1, -1)
