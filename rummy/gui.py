@@ -149,7 +149,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
 
     pygame.init()
     pygame.display.set_caption("Rummikub — Sprint 2 GUI")
-    screen = pygame.display.set_mode((1280, 768))
+    screen = pygame.display.set_mode((1280, 768), pygame.RESIZABLE)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("arial", 18)
     small_font = pygame.font.SysFont("arial", 14)
@@ -171,6 +171,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     TABLE_START_X = 30
     TABLE_START_Y = 80
     ROW_HEIGHT = TILE_H + 30
+    HAND_AREA = pygame.Rect(20, 520, 1240, 200)
 
     def _slots_from_counts(counts: List[int]) -> List[TileSlot]:
         slots: List[TileSlot] = []
@@ -521,13 +522,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 selected_slot = (meld_idx, len(edited_table.melds[meld_idx].slots) - 1)
                 return
 
-        # Drop on hand area => cancel drag
-        hand_area = pygame.Rect(20, 520, 1240, 200)
-        if hand_area.collidepoint(pos):
-            if carried_from and carried_from[0] == "table":
-                meld_idx, slot_idx = carried_from[1], carried_from[2]
-                if meld_idx < len(edited_table.melds):
-                    edited_table.melds[meld_idx].slots.insert(min(slot_idx, len(edited_table.melds[meld_idx].slots)), carried)
+        # Drop on hand area => keep removed tile in hand (do not reinsert)
+        if HAND_AREA.collidepoint(pos):
             carried = None
             carried_from = None
             return
@@ -543,10 +539,27 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     running = True
     while running:
         screen.fill(bg_color)
-        pygame.draw.rect(screen, panel_color, pygame.Rect(10, 10, 1260, 740), border_radius=8, width=2)
+        screen_w, screen_h = screen.get_size()
+        pygame.draw.rect(
+            screen,
+            panel_color,
+            pygame.Rect(10, 10, screen_w - 20, screen_h - 20),
+            border_radius=8,
+            width=2,
+        )
 
         table_title = font.render("Table (drag/drop to rearrange)", True, text_color)
         screen.blit(table_title, (20, 20))
+
+        meld_count = max(1, len(edited_table.melds))
+        HAND_AREA = pygame.Rect(20, screen_h - max(160, int(screen_h * 0.28)), screen_w - 40, max(160, int(screen_h * 0.28)) - 20)
+        timeline_y = HAND_AREA.y - 50
+        TABLE_START_X = 30
+        TABLE_START_Y = 80
+        available_height = max(120, timeline_y - TABLE_START_Y - 20)
+        ROW_HEIGHT = max(50, available_height // meld_count)
+        TILE_H = max(30, ROW_HEIGHT - 20)
+        TILE_W = max(22, int(TILE_H * 0.7))
 
         _ensure_empty_meld(edited_table)
         added_counts = _build_added_tile_counts()
@@ -556,7 +569,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             TABLE_START_X, TABLE_START_Y, added_counts, modified_flags
         )
         hand_slots = _visible_hand_slots()
-        hand_tiles = _layout_hand_tiles(hand_slots, 520, highlight_hand=True)
+        per_row = max(1, (HAND_AREA.width - 20) // (TILE_W + 6))
+        hand_tiles = _layout_hand_tiles(hand_slots, HAND_AREA.y + 10, per_row=per_row, highlight_hand=True)
 
         # Buttons (recomputed each frame for enabled state)
         buttons: List[Tuple[pygame.Rect, str, Callable[[], None], bool]] = []
@@ -569,10 +583,6 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             lbl = font.render(label, True, text_color if enabled else disabled_color)
             screen.blit(lbl, lbl.get_rect(center=rect.center))
 
-        can_play = timeline.at_end()
-        add_button(520, 30, "Add RUN", lambda: edited_table.melds.append(Meld(MeldKind.RUN, [])), can_play)
-        add_button(700, 30, "Add GROUP", lambda: edited_table.melds.append(Meld(MeldKind.GROUP, [])), can_play)
-
         def _reset_draft() -> None:
             nonlocal edited_table, carried, carried_from, selected_slot, selected_empty_slot, message
             edited_table = timeline.current.table.canonicalize()
@@ -582,7 +592,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             selected_empty_slot = None
             message = "Draft reset to current state"
 
-        add_button(880, 30, "Reset draft", _reset_draft, can_play)
+        can_play = timeline.at_end()
+        add_button(700, 30, "Reset draft", _reset_draft, can_play)
 
         def _on_validate() -> None:
             nonlocal message
@@ -592,7 +603,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 return
             _apply_move_and_refresh(move, "Move applied")
 
-        add_button(1060, 30, "Validate PLAY", _on_validate, can_play)
+        add_button(880, 30, "Validate PLAY", _on_validate, can_play)
 
         def _on_draw() -> None:
             nonlocal message
@@ -603,7 +614,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 return
             _apply_move_and_refresh(move, "Drew a tile")
 
-        add_button(1060, 80, "Draw", _on_draw, can_play)
+        add_button(880, 80, "Draw", _on_draw, can_play)
 
         def _on_pass() -> None:
             nonlocal message
@@ -614,9 +625,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 return
             _apply_move_and_refresh(move, "Passed turn")
 
-        add_button(1060, 130, "Pass", _on_pass, can_play)
+        add_button(880, 130, "Pass", _on_pass, can_play)
 
-        timeline_rect = pygame.Rect(20, 470, 1240, 36)
+        timeline_rect = pygame.Rect(20, timeline_y, screen_w - 40, 36)
         segments, ellipsis_rect = _render_timeline_bar(timeline_rect)
 
         info_text = small_font.render(
@@ -624,17 +635,17 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             True,
             text_color,
         )
-        screen.blit(info_text, (20, 450))
+        screen.blit(info_text, (20, timeline_y - 20))
 
         msg_surface = small_font.render(message, True, text_color)
-        screen.blit(msg_surface, (20, 730))
+        screen.blit(msg_surface, (20, screen_h - 30))
 
         toggle_hint = small_font.render("Press 'G' to toggle godmode (show all hands & deck)", True, text_color)
-        screen.blit(toggle_hint, (820, 450))
+        screen.blit(toggle_hint, (max(20, screen_w - 420), timeline_y - 20))
 
         god_panel = pygame.Rect(0, 0, 0, 0)
         if show_godmode:
-            god_panel = pygame.Rect(520, 150, 740, 380)
+            god_panel = pygame.Rect(int(screen_w * 0.42), int(screen_h * 0.2), int(screen_w * 0.55), int(screen_h * 0.5))
             pygame.draw.rect(screen, panel_color, god_panel, border_radius=8)
             pygame.draw.rect(screen, accent_color, god_panel, width=2, border_radius=8)
 
@@ -683,16 +694,16 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             screenshot_taken = True
 
         if modal_open:
-            overlay = pygame.Surface((1280, 768), pygame.SRCALPHA)
+            overlay = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 160))
             screen.blit(overlay, (0, 0))
-            modal_rect = pygame.Rect(200, 140, 880, 500)
+            modal_rect = pygame.Rect(200, 140, screen_w - 400, screen_h - 280)
             pygame.draw.rect(screen, panel_color, modal_rect, border_radius=8)
             pygame.draw.rect(screen, accent_color, modal_rect, width=2, border_radius=8)
             title = font.render("Select a previous turn", True, text_color)
             screen.blit(title, (modal_rect.x + 16, modal_rect.y + 12))
 
-            page_size = 20
+            page_size = max(10, (modal_rect.height - 120) // 26)
             total_pages = max(1, (len(timeline.history) + page_size - 1) // page_size)
             modal_page = max(0, min(modal_page, total_pages - 1))
             start = modal_page * page_size
@@ -780,6 +791,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 elif event.key == pygame.K_PERIOD and ellipsis_rect:
                     modal_open = True
                     modal_page = 0
+            elif event.type == pygame.VIDEORESIZE:
+                screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
                     if modal_open:
