@@ -240,7 +240,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             end_hint = ""
             if selected_meld_end and selected_meld_end[0] == meld_idx:
                 end_hint = " [L]" if selected_meld_end[1] == "left" else " [R]"
-            header_label = small_font.render(f"{meld.kind.value} #{meld_idx+1}{end_hint}", True, text_color)
+            kind_label = meld.kind.value if meld.slots else "MELD"
+            header_label = small_font.render(f"{kind_label} #{meld_idx+1}{end_hint}", True, text_color)
             screen.blit(header_label, (header_rect.x + 4, header_rect.y + 1))
             headers.append((header_rect, meld_idx))
             for slot_idx, slot in enumerate(meld.slots):
@@ -252,47 +253,105 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             y += ROW_HEIGHT
         return layout, headers
 
-    def _assign_joker_for_meld(slot: TileSlot, meld: Meld, to_left: bool) -> Optional[TileSlot]:
+    def _assign_joker_for_meld(slot: TileSlot, meld: Meld, to_left: bool, kind: MeldKind) -> Optional[TileSlot]:
         if slot.tile_id != JOKER_ID:
             return slot
-        if meld.kind == MeldKind.RUN:
-            color = meld.slots[0].effective_color()
-            values = [s.effective_value() for s in meld.slots]
-            new_value = min(values) - 1 if to_left else max(values) + 1
+        if kind == MeldKind.RUN:
+            if meld.slots:
+                color = meld.slots[0].effective_color()
+                values = [s.effective_value() for s in meld.slots]
+                new_value = min(values) - 1 if to_left else max(values) + 1
+            else:
+                color = 0
+                new_value = 1
             return TileSlot(JOKER_ID, color, new_value)
-        if meld.kind == MeldKind.GROUP:
-            value = meld.slots[0].effective_value()
-            used_colors = {s.effective_color() for s in meld.slots}
+        if kind == MeldKind.GROUP:
+            if meld.slots:
+                value = meld.slots[0].effective_value()
+                used_colors = {s.effective_color() for s in meld.slots}
+            else:
+                value = 1
+                used_colors = set()
             for color in range(timeline.current.ruleset.colors):
                 if color not in used_colors:
                     return TileSlot(JOKER_ID, color, value)
             return None
         return None
 
+    def _can_be_valid(kind: MeldKind, slots: List[TileSlot]) -> bool:
+        if not slots:
+            return True
+        try:
+            colors = [s.effective_color() for s in slots]
+            values = [s.effective_value() for s in slots]
+        except ValueError:
+            return False
+        if kind == MeldKind.GROUP:
+            if len(slots) > 4:
+                return False
+            if len(set(values)) != 1:
+                return False
+            return len(set(colors)) == len(colors)
+        if kind == MeldKind.RUN:
+            if len(slots) > timeline.current.ruleset.values:
+                return False
+            if len(set(colors)) != 1:
+                return False
+            if len(set(values)) != len(values):
+                return False
+            min_val = min(values)
+            max_val = max(values)
+            return (max_val - min_val + 1) <= timeline.current.ruleset.values
+        return False
+
+    def _choose_kind_for_slots(slots: List[TileSlot], preferred: Optional[MeldKind]) -> Optional[MeldKind]:
+        possible = [kind for kind in (MeldKind.RUN, MeldKind.GROUP) if _can_be_valid(kind, slots)]
+        if not possible:
+            return None
+        if preferred in possible:
+            return preferred
+        if len(possible) == 1:
+            return possible[0]
+        try:
+            colors = [s.effective_color() for s in slots]
+            values = [s.effective_value() for s in slots]
+        except ValueError:
+            return possible[0]
+        if len(set(values)) == 1 and len(set(colors)) > 1:
+            return MeldKind.GROUP
+        if len(set(colors)) == 1:
+            return MeldKind.RUN
+        return possible[0]
+
     def _try_insert_into_meld(meld_idx: int, slot: TileSlot, to_left: bool) -> bool:
         nonlocal message, selected_slot
         if meld_idx < 0 or meld_idx >= len(edited_table.melds):
             return False
         meld = edited_table.melds[meld_idx]
-        slot_to_use = _assign_joker_for_meld(slot, meld, to_left)
-        if slot_to_use is None:
-            message = "Cannot place joker in this meld"
-            return False
-        new_slots = list(meld.slots)
-        if to_left:
-            new_slots.insert(0, slot_to_use)
-            new_slot_idx = 0
-        else:
-            new_slots.append(slot_to_use)
-            new_slot_idx = len(new_slots) - 1
-        candidate = Meld(meld.kind, new_slots)
-        ok, reason = candidate.is_valid()
-        if not ok:
-            message = f"Cannot extend meld: {reason}"
-            return False
-        edited_table.melds[meld_idx] = candidate
-        selected_slot = (meld_idx, new_slot_idx)
-        return True
+        preferred_kind = meld.kind if meld.slots else None
+        for kind in (preferred_kind, MeldKind.RUN, MeldKind.GROUP):
+            if kind is None:
+                continue
+            slot_to_use = _assign_joker_for_meld(slot, meld, to_left, kind)
+            if slot_to_use is None:
+                continue
+            new_slots = list(meld.slots)
+            if to_left:
+                new_slots.insert(0, slot_to_use)
+                new_slot_idx = 0
+            else:
+                new_slots.append(slot_to_use)
+                new_slot_idx = len(new_slots) - 1
+            chosen_kind = _choose_kind_for_slots(new_slots, preferred=kind)
+            if chosen_kind is None:
+                continue
+            if not _can_be_valid(chosen_kind, new_slots):
+                continue
+            edited_table.melds[meld_idx] = Meld(chosen_kind, new_slots)
+            selected_slot = (meld_idx, new_slot_idx)
+            return True
+        message = "Cannot extend meld with this tile"
+        return False
 
     def _layout_hand_tiles(
         slots: List[TileSlot],
