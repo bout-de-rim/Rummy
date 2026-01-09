@@ -2,33 +2,21 @@
 from __future__ import annotations
 
 """
-Compact Rummikub GUI — runs left, groups right, hand as fixed 4x14 grid.
+Rummikub — Compact GUI (grid-first)
 
-Design constraints enforced at startup:
-- colors == 4
-- values == 13
+Fixes in this version (v4):
+- Colored tiles are back (tile fill color derived from tile color; jokers get purple or assigned color)
+- Better duplicate stack effect (real "second tile" behind + ×N badge)
+- Subtle axis labels (1..13 and J) so empty grids are still usable
+- Local placement validation (only place if it keeps the target run/group locally consistent)
+- Robust crash screen to avoid "silent close"
 
-Interaction model:
-- Select a target meld on the table:
-    * RUN target: click a RUN row (left panel)
-    * GROUP target: click a GROUP column within a block (right panel)
-- Then click a tile in the HAND grid to send one instance of that tile to the selected target,
-  only if the local constraints of that meld would still be satisfied.
-- Commit with Enter (PLAY), Draw with D, Reset draft with R.
-- Debug overlay: toggle with G, scroll with mouse wheel (always reaches bottom).
-- Help hint: H.
-
-Jokers:
-- In hand: always displayed in the last column (J) on row 0.
-- When placing:
-    * into a GROUP: joker value is forced to the selected column value; joker color chosen as first missing.
-    * into a RUN: joker color forced to row color; joker value uses the current "hand joker value" (right‑click joker in hand to cycle 1..13).
-- Right‑click a joker on the TABLE cycles its assigned value 1..13.
+Hard constraint:
+- This GUI only supports exactly 4 colors and 13 values. If not, it refuses to start.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Any
-import os
+from typing import Dict, List, Optional, Tuple
 import traceback
 
 # --- Imports: support package and script execution -----------------------------
@@ -57,7 +45,7 @@ except Exception:  # pragma: no cover
     pygame = None  # type: ignore
 
 
-# --- Pure helpers (adapted from the original gui.py) ---------------------------
+# --- Core helpers (adapted from original gui.py) --------------------------------
 
 def _safe_canonical_table(table: Table) -> Tuple[Optional[Table], str]:
     try:
@@ -97,11 +85,11 @@ def build_play_move(state: GameState, edited_table: Table) -> Tuple[Optional[Mov
 
 def remaining_hand_after_edit(state: GameState, edited_table: Table) -> TileMultiset:
     non_empty = Table([meld for meld in edited_table.melds if meld.slots])
-    canonical_table, error = _safe_canonical_table(non_empty)
+    canonical_table, _ = _safe_canonical_table(non_empty)
     if canonical_table is None:
         return state.hands[state.current_player].copy()
 
-    delta, error = compute_delta_from_tables(state.table.canonicalize(), canonical_table)
+    delta, _ = compute_delta_from_tables(state.table.canonicalize(), canonical_table)
     if delta is None:
         return state.hands[state.current_player].copy()
 
@@ -111,7 +99,7 @@ def remaining_hand_after_edit(state: GameState, edited_table: Table) -> TileMult
         return state.hands[state.current_player].copy()
 
 
-# --- Theme --------------------------------------------------------------------
+# --- Theme ---------------------------------------------------------------------
 
 BG = (22, 27, 34)
 PANEL = (30, 36, 46)
@@ -123,15 +111,22 @@ ERR = (235, 87, 87)
 WARN = (255, 170, 40)
 
 COLOR_PALETTE = [
-    (220, 80, 80),   # red
-    (86, 148, 227),  # blue
-    (66, 171, 119),  # green
-    (221, 164, 66),  # yellow/orange
+    (220, 80, 80),    # red
+    (86, 148, 227),   # blue
+    (66, 171, 119),   # green
+    (221, 164, 66),   # yellow/orange
 ]
+JOKER_COLOR = (170, 110, 210)
 
 
 def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
+
+def _mix(c: Tuple[int, int, int], f: float, toward=(0, 0, 0)) -> Tuple[int, int, int]:
+    return (int(c[0] * (1 - f) + toward[0] * f),
+            int(c[1] * (1 - f) + toward[1] * f),
+            int(c[2] * (1 - f) + toward[2] * f))
 
 
 def _tile_value(slot: TileSlot) -> Optional[int]:
@@ -146,15 +141,19 @@ def _tile_color_index(slot: TileSlot) -> Optional[int]:
     return (slot.tile_id // 13) % 4
 
 
-def _ms_total(ms: TileMultiset) -> int:
-    return sum(ms.counts)
+def _tile_bg(slot: TileSlot) -> Tuple[int, int, int]:
+    ci = _tile_color_index(slot)
+    if ci is None:
+        return JOKER_COLOR
+    return COLOR_PALETTE[ci]
 
 
-def _hand_grid(current_hand: TileMultiset) -> Dict[Tuple[int, int], int]:
-    """Return mapping (row,col)->count for a fixed 4x14 grid.
+def _tile_text_color(bg: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    lum = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2]
+    return (20, 22, 26) if lum > 140 else (245, 246, 250)
 
-    Rows 0..3 correspond to colors (R,B,G,Y). Cols 0..12 correspond to values 1..13. Col 13 is Jokers.
-    """
+
+def _hand_grid_counts(current_hand: TileMultiset) -> Dict[Tuple[int, int], int]:
     grid: Dict[Tuple[int, int], int] = {}
     for tid, cnt in enumerate(current_hand.counts):
         if cnt <= 0:
@@ -163,19 +162,19 @@ def _hand_grid(current_hand: TileMultiset) -> Dict[Tuple[int, int], int]:
             grid[(0, 13)] = grid.get((0, 13), 0) + cnt
         else:
             color = (tid // 13) % 4
-            value_idx = (tid % 13)  # 0..12
+            value_idx = (tid % 13)
             grid[(color, value_idx)] = grid.get((color, value_idx), 0) + cnt
     return grid
 
 
-# --- Hit testing ---------------------------------------------------------------
+# --- Hit testing structures ----------------------------------------------------
 
 @dataclass
 class HandCell:
     rect: pygame.Rect
     row: int
     col: int
-    tile_id: Optional[int]  # representative id (if count>0), else None
+    tile_id: Optional[int]
     count: int
 
 
@@ -202,7 +201,6 @@ class TileHit:
 # --- Board mapping -------------------------------------------------------------
 
 def _run_color_for_meld(m: Meld) -> int:
-    # Determine run color from first non-joker tile; fallback to assigned_color of a joker; else 0
     for s in m.slots:
         if s.tile_id != JOKER_ID:
             return (s.tile_id // 13) % 4
@@ -213,7 +211,6 @@ def _run_color_for_meld(m: Meld) -> int:
 
 
 def map_runs_rows_to_meld_indices(table: Table) -> Dict[int, int]:
-    """Map run melds to the 8 run rows (2 per color)."""
     rows: Dict[int, int] = {}
     per_color: Dict[int, List[int]] = {0: [], 1: [], 2: [], 3: []}
     for idx, m in enumerate(table.melds):
@@ -230,7 +227,6 @@ def map_runs_rows_to_meld_indices(table: Table) -> Dict[int, int]:
 
 
 def groups_by_value(table: Table) -> Dict[int, List[int]]:
-    """Map value_idx 0..12 -> group meld indices for that value."""
     d: Dict[int, List[int]] = {i: [] for i in range(13)}
     for idx, m in enumerate(table.melds):
         if m.kind != MeldKind.GROUP or not m.slots:
@@ -252,17 +248,12 @@ def groups_by_value(table: Table) -> Dict[int, List[int]]:
 
 
 def group_block_count(table: Table) -> int:
-    """Number of 4x13 blocks required so each value can have enough group slots.
-
-    Default minimum is 2 blocks, but if any value has >2 groups, grow to max_per_value.
-    """
     by_val = groups_by_value(table)
     max_per_value = max((len(v) for v in by_val.values()), default=0)
     return max(2, max_per_value)
 
 
 def map_groups_cells_to_meld_indices(table: Table) -> Dict[Tuple[int, int], int]:
-    """Map (block,value_idx)->meld_idx for group melds, block being the occurrence rank for that value."""
     mapping: Dict[Tuple[int, int], int] = {}
     by_val = groups_by_value(table)
     for val_idx, melds in by_val.items():
@@ -271,53 +262,33 @@ def map_groups_cells_to_meld_indices(table: Table) -> Dict[Tuple[int, int], int]
     return mapping
 
 
-# --- Local placement constraints (for "si c'est autorisé") ---------------------
-
-def _run_values_and_colors(slots: List[TileSlot]) -> Tuple[List[int], List[int]]:
-    vals: List[int] = []
-    cols: List[int] = []
-    for s in slots:
-        v = _tile_value(s)
-        c = _tile_color_index(s)
-        if v is None or c is None:
-            continue
-        vals.append(v)
-        cols.append(c)
-    return vals, cols
-
+# --- Local "authorized" checks -------------------------------------------------
 
 def can_insert_into_run(run_slots: List[TileSlot], new_slot: TileSlot, row_color: int) -> Tuple[bool, str]:
-    # enforce color consistency (non-jokers) and assigned_color
     if new_slot.tile_id == JOKER_ID:
         if new_slot.assigned_color != row_color:
             return False, "joker color mismatch"
     else:
         if ((new_slot.tile_id // 13) % 4) != row_color:
-            return False, "tile color mismatch with run row"
+            return False, "tile color mismatch"
 
     candidate = list(run_slots) + [new_slot]
-    # all concrete colors must be the row color
-    for s in candidate:
-        if s.tile_id != JOKER_ID:
-            if ((s.tile_id // 13) % 4) != row_color:
-                return False, "run mixed colors"
-        else:
-            if s.assigned_color != row_color:
-                return False, "run joker color mismatch"
 
-    # values: allow len<2 freely; else require "consecutive set" using assigned joker values
     vals: List[int] = []
     for s in candidate:
         v = _tile_value(s)
         if v is None:
             return False, "joker has no value"
         vals.append(v)
-    if len(vals) <= 1:
-        return True, ""
+
     if len(set(vals)) != len(vals):
-        return False, "duplicate value in run"
-    vals_sorted = sorted(vals)
-    if vals_sorted[-1] - vals_sorted[0] != len(vals_sorted) - 1:
+        return False, "duplicate value"
+
+    if len(vals) <= 2:
+        return True, ""
+
+    vs = sorted(vals)
+    if vs[-1] - vs[0] != len(vs) - 1:
         return False, "run not consecutive"
     return True, ""
 
@@ -328,77 +299,76 @@ def can_insert_into_group(group_slots: List[TileSlot], new_slot: TileSlot, value
     if len(candidate) > 4:
         return False, "group too large"
 
-    # enforce values all equal to target_val
+    colors: List[int] = []
     for s in candidate:
         v = _tile_value(s)
         if v is None:
             return False, "joker has no value"
         if v != target_val:
-            return False, "group value mismatch"
-
-    # enforce distinct colors for non-jokers and assigned colors for jokers
-    colors: List[int] = []
-    for s in candidate:
+            return False, "value mismatch"
         c = _tile_color_index(s)
         if c is None:
             return False, "joker has no color"
         colors.append(c)
+
     if len(set(colors)) != len(colors):
-        return False, "duplicate color in group"
+        return False, "duplicate color"
     return True, ""
 
 
-# --- Drawing ------------------------------------------------------------------
+# --- Drawing primitives --------------------------------------------------------
 
-def draw_panel(surface, rect: pygame.Rect, title: Optional[str], font):
+def draw_panel(surface, rect: pygame.Rect):
     pygame.draw.rect(surface, PANEL, rect, border_radius=10)
     pygame.draw.rect(surface, PANEL_LINE, rect, width=2, border_radius=10)
-    if title:
-        label = font.render(title, True, SUB)
-        surface.blit(label, (rect.x + 10, rect.y + 6))
 
 
-def draw_button(surface, rect: pygame.Rect, label: str, font, enabled: bool = True):
-    bg = (46, 56, 69) if enabled else (35, 42, 52)
-    border = ACCENT if enabled else (60, 70, 82)
-    pygame.draw.rect(surface, bg, rect, border_radius=10)
-    pygame.draw.rect(surface, border, rect, width=2, border_radius=10)
-    txt = font.render(label, True, TEXT if enabled else (120, 130, 140))
+def draw_button(surface, rect: pygame.Rect, label: str, font):
+    pygame.draw.rect(surface, (46, 56, 69), rect, border_radius=10)
+    pygame.draw.rect(surface, ACCENT, rect, width=2, border_radius=10)
+    txt = font.render(label, True, TEXT)
     surface.blit(txt, txt.get_rect(center=rect.center))
 
 
-def draw_tile(surface, rect: pygame.Rect, slot: TileSlot, small_font, highlight=False, count_badge: Optional[int] = None):
+def draw_tile(surface, rect: pygame.Rect, slot: TileSlot, small_font, highlight=False, count_badge: Optional[int] = None, stacked_back: bool = False):
     radius = 6
+    bg = _tile_bg(slot)
+    if stacked_back:
+        bg = _mix(bg, 0.22, toward=(0, 0, 0))
     border = ACCENT if highlight else (60, 70, 85)
-    pygame.draw.rect(surface, (245, 245, 245), rect, border_radius=radius)
+
+    pygame.draw.rect(surface, bg, rect, border_radius=radius)
     pygame.draw.rect(surface, border, rect, width=2, border_radius=radius)
 
     inner = rect.inflate(-8, -8)
     v = _tile_value(slot)
-    label = f"J{v}" if slot.tile_id == JOKER_ID else str(v if v is not None else "?")
+    label = (f"J{v}" if slot.tile_id == JOKER_ID else str(v if v is not None else "?"))
 
-    font_size = max(12, int(inner.height * 0.52))
+    font_size = max(12, int(inner.height * 0.58))
     font = pygame.font.SysFont("arial", font_size, bold=True)
-    txt = font.render(label, True, (40, 40, 50))
+    txt = font.render(label, True, _tile_text_color(bg))
     surface.blit(txt, txt.get_rect(center=inner.center))
 
+    if slot.tile_id == JOKER_ID:
+        pygame.draw.line(surface, _tile_text_color(bg), (rect.left + 6, rect.bottom - 6), (rect.right - 6, rect.top + 6), 2)
+
     if count_badge and count_badge > 1:
-        badge = small_font.render(f"×{count_badge}", True, (245, 245, 245))
-        badge_bg = pygame.Rect(rect.right - 20, rect.top + 4, 16, 16)
-        pygame.draw.rect(surface, (55, 65, 85), badge_bg, border_radius=8)
+        badge = small_font.render(f"×{count_badge}", True, (245, 246, 250))
+        badge_bg = pygame.Rect(rect.right - 22, rect.top + 4, 18, 18)
+        pygame.draw.rect(surface, (55, 65, 85), badge_bg, border_radius=9)
         surface.blit(badge, badge.get_rect(center=badge_bg.center))
 
 
-def status_bar(surface, rect: pygame.Rect, left: str, right: str, small_font, color=SUB):
+def status_bar(surface, rect: pygame.Rect, left: str, right: str, small_font):
     pygame.draw.rect(surface, PANEL, rect, border_radius=10)
     pygame.draw.rect(surface, PANEL_LINE, rect, width=2, border_radius=10)
-    l = small_font.render(left, True, color)
-    r = small_font.render(right, True, color)
+    l = small_font.render(left, True, SUB)
+    r = small_font.render(right, True, SUB)
     surface.blit(l, (rect.x + 10, rect.y + (rect.height - l.get_height()) // 2))
     surface.blit(r, (rect.right - 10 - r.get_width(), rect.y + (rect.height - r.get_height()) // 2))
 
 
-# --- GUI entry ----------------------------------------------------------------
+# --- GUI entry -----------------------------------------------------------------
 
 def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) -> None:  # pragma: no cover
     if pygame is None:
@@ -406,7 +376,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
 
     ruleset = ruleset or Ruleset()
     if getattr(ruleset, "colors", 4) != 4 or getattr(ruleset, "values", 13) != 13:
-        raise RuntimeError("This compact GUI only supports exactly 4 colors and 13 values (Rummikub standard).")
+        raise RuntimeError("This compact GUI only supports exactly 4 colors and 13 values.")
 
     pygame.init()
     pygame.display.set_caption("Rummikub — Compact GUI")
@@ -416,8 +386,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     font = pygame.font.SysFont("arial", 18)
     title_font = pygame.font.SysFont("arial", 24, bold=True)
     small_font = pygame.font.SysFont("arial", 14)
+    axis_font = pygame.font.SysFont("arial", 12)
 
-    # Game state
+    # Game state + timeline
     state = new_game(ruleset=ruleset, rng_seed=seed)
     timeline: List[GameState] = [state]
     time_idx = 0
@@ -428,12 +399,12 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     edited_table = current().table.canonicalize()
 
     # UI state
-    selected_target: Optional[Tuple[str, int, int]] = None  # ('run', row, -1) or ('group', block, value_idx)
+    selected_target: Optional[Tuple[str, int, int]] = None
     message = "Sélectionnez un RUN (gauche) ou un GROUP (droite), puis cliquez une tuile de la main pour l'envoyer si autorisé."
     show_debug = False
     debug_scroll = 10**9
     debug_log: List[str] = []
-    hand_joker_value = 1  # used when placing joker into a run
+    hand_joker_value = 1
 
     # Hit regions
     hand_cells: List[HandCell] = []
@@ -441,18 +412,36 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     groups_col_hits: List[GroupsColHit] = []
     tile_hits: List[TileHit] = []
 
-    # --- Helpers for mutation --------------------------------------------------
-
     def reset_draft():
         nonlocal edited_table, selected_target
         edited_table = current().table.canonicalize()
         selected_target = None
 
-    def append_debug(s: str):
-        debug_log.append(s)
+    def crash_screen(tb: str):
+        lines = tb.splitlines()[-40:]
+        W, H = screen.get_size()
+        while True:
+            screen.fill((15, 18, 23))
+            screen.blit(title_font.render("GUI crashed — traceback:", True, ERR), (20, 20))
+            y = 60
+            for ln in lines:
+                s = small_font.render(ln[:180], True, (230, 230, 230))
+                screen.blit(s, (20, y))
+                y += small_font.get_height() + 2
+                if y > H - 40:
+                    break
+            screen.blit(small_font.render("Press ESC or close the window.", True, WARN), (20, H - 28))
+            pygame.display.flip()
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    pygame.quit()
+                    return
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    return
 
-    def make_slot_for_target(tile_id: int, target: Tuple[str, int, int], table: Table) -> TileSlot:
-        """Create a TileSlot instance appropriate for the placement target."""
+    def make_slot_for_target(tile_id: int, target: Tuple[str, int, int]) -> TileSlot:
+        nonlocal hand_joker_value, edited_table
         kind, a, b = target
         if tile_id != JOKER_ID:
             return TileSlot(tile_id)
@@ -460,12 +449,11 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         if kind == "group":
             block, value_idx = a, b
             target_val = value_idx + 1
-            # choose first missing color in that group meld (if any)
-            mapping = map_groups_cells_to_meld_indices(table)
+            mapping = map_groups_cells_to_meld_indices(edited_table)
             meld_idx = mapping.get((block, value_idx))
             used = set()
             if meld_idx is not None:
-                for s in table.melds[meld_idx].slots:
+                for s in edited_table.melds[meld_idx].slots:
                     c = _tile_color_index(s)
                     if c is not None:
                         used.add(c)
@@ -482,17 +470,15 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         if selected_target is None:
             message = "Aucun meld sélectionné."
             return
-
-        slot = make_slot_for_target(tile_id, selected_target, edited_table)
-
+        slot = make_slot_for_target(tile_id, selected_target)
         kind, a, b = selected_target
+
         if kind == "run":
             row = a
             row_color = row // 2
             row_map = map_runs_rows_to_meld_indices(edited_table)
             meld_idx = row_map.get(row)
             if meld_idx is None:
-                # new meld with a single tile is allowed as draft
                 ok, why = can_insert_into_run([], slot, row_color)
                 if not ok:
                     message = f"Placement refusé: {why}"
@@ -534,18 +520,11 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         if s.tile_id != JOKER_ID:
             return
         new_v = 1 if (s.assigned_value is None) else (s.assigned_value % 13) + 1
-        # keep assigned_color
         new_c = 0 if s.assigned_color is None else s.assigned_color
         m.slots[slot_idx] = TileSlot(JOKER_ID, assigned_color=new_c, assigned_value=new_v)
         message = f"Joker => valeur {new_v}"
 
-    # --- Error screen wrapper: prevents "silent close" -------------------------
-
-    def run_loop():
-        nonlocal screen, time_idx, edited_table, selected_target, message
-        nonlocal show_debug, debug_scroll, hand_joker_value
-        nonlocal hand_cells, runs_row_hits, groups_col_hits, tile_hits
-
+    try:
         running = True
         while running:
             W, H = screen.get_size()
@@ -565,13 +544,12 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             hand_panel = pygame.Rect(margin, board.bottom + margin, W - 2 * margin, hand_h)
             status = pygame.Rect(margin, hand_panel.bottom + margin, W - 2 * margin, status_h)
 
-            # --- Header
+            # Header
             pygame.draw.rect(screen, PANEL, header, border_radius=10)
             pygame.draw.rect(screen, PANEL_LINE, header, width=2, border_radius=10)
             screen.blit(title_font.render("Rummikub", True, TEXT), (header.x + 12, header.y + 12))
 
-            # Buttons (no Pass, no +Meld)
-            # Robust layout: wrap buttons into available space
+            # Buttons
             buttons = [("Play (Enter)", "play"), ("Draw (D)", "draw"), ("Reset (R)", "reset"), ("Debug (G)", "debug"), ("Help (H)", "help")]
             bx = header.x + 180
             by = header.y + 10
@@ -587,49 +565,39 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                     by += bh + 8
                 r = pygame.Rect(bx, by, bw, bh)
                 btn_rects[key] = r
-                draw_button(screen, r, label, font, enabled=True)
+                draw_button(screen, r, label, font)
                 bx += bw + gap
 
-            # Update header height if it wrapped (visual only; panels already placed)
-            # (We accept that wrapped header may overlap board for very small windows; user asked collisions must disappear)
-            # So: if we wrapped, we simply draw over header area; the board starts below original header rect.
-
-            # --- Board split: left RUNS, right GROUPS
+            # Board split
             left_w = int(board.width * 0.56)
             right_w = board.width - left_w - margin
             runs_panel = pygame.Rect(board.x, board.y, left_w, board.height)
             groups_panel = pygame.Rect(runs_panel.right + margin, board.y, right_w, board.height)
+            draw_panel(screen, runs_panel)
+            draw_panel(screen, groups_panel)
 
-            draw_panel(screen, runs_panel, "RUNS", font)
-            draw_panel(screen, groups_panel, "GROUPS", font)
-
-            # Build mapping
             row_map = map_runs_rows_to_meld_indices(edited_table)
             group_map = map_groups_cells_to_meld_indices(edited_table)
             nblocks = group_block_count(edited_table)
-
-            # Tile hit list (for right-click joker)
             tile_hits = []
 
-            # --- Runs grid (8x13)
+            # RUNS grid 8x13
             runs_row_hits = []
             grid_x = runs_panel.x + 12
-            grid_y = runs_panel.y + 24
+            grid_y = runs_panel.y + 20
             grid_w = runs_panel.width - 24
-            grid_h = runs_panel.height - 36
+            grid_h = runs_panel.height - 28
             rows, cols = 8, 13
             cell_w = grid_w / cols
             cell_h = grid_h / rows
-            tile_w = max(22, int(cell_w * 0.78))
-            tile_h = max(30, int(cell_h * 0.78))
+            tile_w = max(22, int(cell_w * 0.90))
+            tile_h = max(30, int(cell_h * 0.90))
 
-            # highlight selected row background
             if selected_target and selected_target[0] == "run":
                 sel_row = selected_target[1]
-                hl = pygame.Rect(grid_x, grid_y + sel_row * cell_h, grid_w, cell_h)
+                hl = pygame.Rect(int(grid_x), int(grid_y + sel_row * cell_h), int(grid_w), int(cell_h))
                 pygame.draw.rect(screen, (40, 50, 66), hl)
 
-            # grid lines
             for r in range(rows + 1):
                 y = grid_y + r * cell_h
                 pygame.draw.line(screen, PANEL_LINE, (grid_x, y), (grid_x + grid_w, y), 1)
@@ -637,102 +605,92 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 x = grid_x + c * cell_w
                 pygame.draw.line(screen, PANEL_LINE, (x, grid_y), (x, grid_y + grid_h), 1)
 
-            # Row hit rects
-            for r in range(rows):
-                rr = pygame.Rect(grid_x, int(grid_y + r * cell_h), int(grid_w), int(cell_h))
-                runs_row_hits.append(RunsRowHit(rect=rr, row=r))
+            for c in range(cols):
+                screen.blit(axis_font.render(str(c + 1), True, SUB), (int(grid_x + c * cell_w + 3), runs_panel.y + 4))
 
-            # Draw run tiles placed by value (column)
+            for r in range(rows):
+                rr = pygame.Rect(int(grid_x), int(grid_y + r * cell_h), int(grid_w), int(cell_h))
+                runs_row_hits.append(RunsRowHit(rect=rr, row=r))
+                sw = pygame.Rect(runs_panel.x + 4, int(grid_y + r * cell_h + 4), 6, int(cell_h - 8))
+                pygame.draw.rect(screen, COLOR_PALETTE[r // 2], sw, border_radius=3)
+
             for row, meld_idx in row_map.items():
                 meld = edited_table.melds[meld_idx]
                 for slot_idx, s in enumerate(meld.slots):
                     v = _tile_value(s)
                     if not v:
                         continue
-                    col = v - 1
+                    col = _clamp(v - 1, 0, 12)
                     cx = grid_x + col * cell_w + (cell_w - tile_w) / 2
                     cy = grid_y + row * cell_h + (cell_h - tile_h) / 2
                     rect = pygame.Rect(int(cx), int(cy), tile_w, tile_h)
-                    draw_tile(screen, rect, s, small_font, highlight=False)
+                    draw_tile(screen, rect, s, small_font)
                     tile_hits.append(TileHit(rect=rect, meld_idx=meld_idx, slot_idx=slot_idx))
 
-            # --- Groups grid: blocks stacked vertically, each block 4x13
+            # GROUPS grid blocks x (4x13)
+            groups_col_hits = []
             g_x = groups_panel.x + 12
-            g_y = groups_panel.y + 24
+            g_y = groups_panel.y + 20
             g_w = groups_panel.width - 24
-            g_h = groups_panel.height - 36
+            g_h = groups_panel.height - 28
             block_h = g_h / nblocks if nblocks > 0 else g_h
             rh = block_h / 4.0
             col_w = g_w / 13.0
 
-            groups_col_hits = []
-            # highlight selected group column area
             if selected_target and selected_target[0] == "group":
                 sel_block, sel_val = selected_target[1], selected_target[2]
                 hl = pygame.Rect(int(g_x + sel_val * col_w), int(g_y + sel_block * block_h), int(col_w), int(block_h))
                 pygame.draw.rect(screen, (40, 50, 66), hl)
 
-            # grid lines + selectable columns
+            for c in range(13):
+                screen.blit(axis_font.render(str(c + 1), True, SUB), (int(g_x + c * col_w + 3), groups_panel.y + 4))
+
             for b in range(nblocks):
                 top = g_y + b * block_h
-                # column hits (value selection per block)
                 for c in range(13):
                     cr = pygame.Rect(int(g_x + c * col_w), int(top), int(col_w), int(block_h))
                     groups_col_hits.append(GroupsColHit(rect=cr, block=b, value_idx=c))
-                # lines
                 for r in range(4 + 1):
                     y = top + r * rh
                     pygame.draw.line(screen, PANEL_LINE, (g_x, y), (g_x + g_w, y), 1)
                 for c in range(13 + 1):
                     x = g_x + c * col_w
                     pygame.draw.line(screen, PANEL_LINE, (x, top), (x, top + block_h), 1)
+                for r in range(4):
+                    sw = pygame.Rect(groups_panel.x + 4, int(top + r * rh + 4), 6, int(rh - 8))
+                    pygame.draw.rect(screen, COLOR_PALETTE[r], sw, border_radius=3)
 
-            # Draw group tiles: column = value, row = color
             for (block, val_idx), meld_idx in group_map.items():
                 top = g_y + block * block_h
                 meld = edited_table.melds[meld_idx]
-                used = set()
-                # determine used colors to place jokers in unused rows deterministically
-                for s in meld.slots:
-                    c = _tile_color_index(s)
-                    if c is not None:
-                        used.add(c)
-
                 for slot_idx, s in enumerate(meld.slots):
-                    # value must match val_idx + 1 for a good display; if not, still display at its own value
                     v = _tile_value(s)
                     if v is None:
                         continue
-                    display_val_idx = val_idx
-                    if v != val_idx + 1:
-                        display_val_idx = _clamp(v - 1, 0, 12)
-
+                    display_val_idx = _clamp(v - 1, 0, 12)
                     c = _tile_color_index(s)
                     if c is None:
-                        # pick first unused
-                        c = next((k for k in range(4) if k not in used), 0)
-                        used.add(c)
-
+                        c = 0
                     cx = g_x + display_val_idx * col_w + (col_w - tile_w) / 2
                     cy = top + c * rh + (rh - tile_h) / 2
                     rect = pygame.Rect(int(cx), int(cy), tile_w, tile_h)
-                    draw_tile(screen, rect, s, small_font, highlight=False)
+                    draw_tile(screen, rect, s, small_font)
                     tile_hits.append(TileHit(rect=rect, meld_idx=meld_idx, slot_idx=slot_idx))
 
-            # --- Hand panel: fixed 4x14 grid with stacking
-            draw_panel(screen, hand_panel, "Hand", font)
-            hand_cells = []
+            # HAND grid 4x14
+            draw_panel(screen, hand_panel)
+            screen.blit(font.render("Hand", True, SUB), (hand_panel.x + 10, hand_panel.y + 6))
+
             hx = hand_panel.x + 12
-            hy = hand_panel.y + 30
+            hy = hand_panel.y + 26
             hw = hand_panel.width - 24
-            hh = hand_panel.height - 42
+            hh = hand_panel.height - 36
             hrows, hcols = 4, 14
             cw = hw / hcols
             ch = hh / hrows
-            tw = max(22, int(cw * 0.78))
-            th = max(30, int(ch * 0.78))
+            tw = max(22, int(cw * 0.90))
+            th = max(30, int(ch * 0.90))
 
-            # grid lines
             for r in range(hrows + 1):
                 y = hy + r * ch
                 pygame.draw.line(screen, PANEL_LINE, (hx, y), (hx + hw, y), 1)
@@ -740,91 +698,79 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 x = hx + c * cw
                 pygame.draw.line(screen, PANEL_LINE, (x, hy), (x, hy + hh), 1)
 
-            remaining = remaining_hand_after_edit(current(), edited_table)
-            grid = _hand_grid(remaining)
+            for r in range(4):
+                sw = pygame.Rect(hand_panel.x + 4, int(hy + r * ch + 4), 6, int(ch - 8))
+                pygame.draw.rect(screen, COLOR_PALETTE[r], sw, border_radius=3)
 
-            # pre-compute representative tile_id per cell
+            for c in range(13):
+                screen.blit(axis_font.render(str(c + 1), True, SUB), (int(hx + c * cw + 3), hand_panel.y + 6))
+            screen.blit(axis_font.render("J", True, SUB), (int(hx + 13 * cw + 3), hand_panel.y + 6))
+            j_val_lbl = small_font.render(f"J={hand_joker_value}", True, SUB)
+            screen.blit(j_val_lbl, (hand_panel.right - 10 - j_val_lbl.get_width(), hand_panel.y + 6))
+
+            remaining = remaining_hand_after_edit(current(), edited_table)
+            grid = _hand_grid_counts(remaining)
+            hand_cells = []
+
             for r in range(hrows):
                 for c in range(hcols):
                     count = grid.get((r, c), 0)
                     rep: Optional[int] = None
                     if count > 0:
-                        if c == 13:
-                            rep = JOKER_ID
-                        else:
-                            rep = r * 13 + c
+                        rep = (JOKER_ID if c == 13 else (r * 13 + c))
                     cell_rect = pygame.Rect(int(hx + c * cw), int(hy + r * ch), int(cw), int(ch))
                     hand_cells.append(HandCell(rect=cell_rect, row=r, col=c, tile_id=rep, count=count))
 
                     if count > 0 and rep is not None:
-                        # stacking effect
-                        main_rect = cell_rect.inflate(int(-cw * 0.18), int(-ch * 0.18))
+                        main = cell_rect.inflate(int(-cw * 0.10), int(-ch * 0.10))
                         if count > 1:
-                            under = main_rect.move(6, 5)
-                            pygame.draw.rect(screen, (45, 55, 70), under, border_radius=6)
+                            back = main.move(6, 5)
+                            back_slot = TileSlot(JOKER_ID, assigned_color=None, assigned_value=hand_joker_value) if rep == JOKER_ID else TileSlot(rep)
+                            draw_tile(screen, back, back_slot, small_font, stacked_back=True)
+                        slot = TileSlot(JOKER_ID, assigned_color=None, assigned_value=hand_joker_value) if rep == JOKER_ID else TileSlot(rep)
+                        draw_tile(screen, main, slot, small_font, count_badge=count)
 
-                        if rep == JOKER_ID:
-                            slot = TileSlot(JOKER_ID, assigned_color=0, assigned_value=hand_joker_value)
-                        else:
-                            slot = TileSlot(rep)
-                        draw_tile(screen, main_rect, slot, small_font, highlight=False, count_badge=count)
-
-            # show current hand joker value near joker column header (minimal)
-            j_label = small_font.render(f"J={hand_joker_value}", True, SUB)
-            screen.blit(j_label, (int(hx + 13 * cw + 6), int(hy - 18)))
-
-            # --- Status bar
+            # Status bar
             right = f"À jouer : Joueur {current().current_player + 1}"
-            status_bar(screen, status, message, right, small_font, color=SUB)
+            status_bar(screen, status, message, right, small_font)
 
-            # --- Debug overlay
+            # Debug overlay (optional) — kept minimal here
             if show_debug:
-                dbg_w = int(W * 0.38)
-                dbg_h = int(H * 0.42)
-                dbg = pygame.Rect(margin, header.bottom + margin, dbg_w, dbg_h)
+                dbg = pygame.Rect(margin, header.bottom + margin, int(W * 0.38), int(H * 0.42))
                 pygame.draw.rect(screen, (20, 26, 34), dbg, border_radius=10)
                 pygame.draw.rect(screen, (90, 98, 118), dbg, width=2, border_radius=10)
                 pad = 8
                 clip = pygame.Rect(dbg.x + pad, dbg.y + pad, dbg.width - 2 * pad, dbg.height - 2 * pad)
-                # Build lines
                 lines = [
                     f"timeline={time_idx+1}/{len(timeline)}",
-                    f"turn={getattr(current(), 'turn', '?')}  deck={len(getattr(current(), 'deck', []))}",
-                    f"hand={_ms_total(remaining)}",
-                    f"table_melds={len(edited_table.melds)}  blocks={nblocks}",
-                    f"selected={selected_target}",
+                    f"turn={getattr(current(), 'turn', '?')} deck={len(getattr(current(), 'deck', []))}",
+                    f"hand_remaining={sum(remaining.counts)}",
+                    f"edited_melds={len(edited_table.melds)} group_blocks={nblocks}",
+                    f"selected_target={selected_target}",
                     "",
                     *debug_log[-300:],
                 ]
-                # Measure content height
                 lh = small_font.get_height() + 2
                 content_h = lh * len(lines)
                 max_scroll = max(0, content_h - clip.height)
                 debug_scroll = _clamp(debug_scroll, 0, max_scroll)
-
-                # Draw with clipping
-                prev_clip = screen.get_clip()
+                prev = screen.get_clip()
                 screen.set_clip(clip)
                 y = clip.y - debug_scroll
                 for ln in lines:
-                    s = small_font.render(ln, True, (210, 216, 225))
-                    screen.blit(s, (clip.x, y))
+                    screen.blit(small_font.render(ln, True, (210, 216, 225)), (clip.x, y))
                     y += lh
-                screen.set_clip(prev_clip)
+                screen.set_clip(prev)
 
-            # --- Events
+            # Events
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-
                 elif event.type == pygame.VIDEORESIZE:
                     screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
-
                 elif event.type == pygame.MOUSEWHEEL:
                     if show_debug:
-                        debug_scroll -= event.y * 24  # natural
-                    # no other scrolling in this compact UI
-
+                        debug_scroll -= event.y * 24
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
@@ -832,18 +778,15 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         move, err = build_play_move(current(), edited_table)
                         if move:
                             nxt = apply_move(current(), move)
-                            # truncate history if not at end
-                            nonlocal_time_idx = time_idx  # read
                             if time_idx != len(timeline) - 1:
                                 timeline[:] = timeline[: time_idx + 1]
                             timeline.append(nxt)
                             time_idx = len(timeline) - 1
                             edited_table = current().table.canonicalize()
                             message = "PLAY effectué."
-                            append_debug("PLAY committed")
                         else:
                             message = f"PLAY invalide: {err}"
-                            append_debug(f"PLAY invalid: {err}")
+                            debug_log.append(f"PLAY invalid: {err}")
                     elif event.key == pygame.K_d:
                         move = Move.draw()
                         nxt = apply_move(current(), move)
@@ -853,7 +796,6 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         time_idx = len(timeline) - 1
                         edited_table = current().table.canonicalize()
                         message = "Pioche effectuée."
-                        append_debug("DRAW committed")
                     elif event.key == pygame.K_r:
                         reset_draft()
                         message = "Draft réinitialisé."
@@ -873,10 +815,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             time_idx += 1
                             reset_draft()
                             message = "Historique: suivant."
-
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:
-                        # Buttons
                         if btn_rects["play"].collidepoint(event.pos):
                             pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
                         elif btn_rects["draw"].collidepoint(event.pos):
@@ -888,7 +828,6 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         elif btn_rects["help"].collidepoint(event.pos):
                             pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_h))
                         else:
-                            # Select run row
                             hit_any = False
                             for rr in runs_row_hits:
                                 if rr.rect.collidepoint(event.pos):
@@ -896,72 +835,40 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                                     message = f"RUN sélectionné (couleur {rr.row//2 + 1}, slot {rr.row%2 + 1})"
                                     hit_any = True
                                     break
-                            if hit_any:
-                                pass
-                            else:
-                                # Select group column
+                            if not hit_any:
                                 for gc in groups_col_hits:
                                     if gc.rect.collidepoint(event.pos):
                                         selected_target = ("group", gc.block, gc.value_idx)
                                         message = f"GROUP sélectionné (valeur {gc.value_idx+1}, bloc {gc.block+1})"
                                         hit_any = True
                                         break
-                                if not hit_any:
-                                    # Place from hand if clicked a non-empty cell
-                                    for hc in hand_cells:
-                                        if hc.rect.collidepoint(event.pos) and hc.count > 0 and hc.tile_id is not None:
-                                            try_place_from_hand(hc.tile_id)
-                                            break
-
+                            if not hit_any:
+                                for hc in hand_cells:
+                                    if hc.rect.collidepoint(event.pos) and hc.count > 0 and hc.tile_id is not None:
+                                        try_place_from_hand(hc.tile_id)
+                                        break
                     elif event.button == 3:
-                        # Right-click on hand joker -> cycle hand_joker_value
+                        # hand joker cycles its chosen value (used for runs)
                         for hc in hand_cells:
                             if hc.rect.collidepoint(event.pos) and hc.tile_id == JOKER_ID and hc.count > 0:
                                 hand_joker_value = (hand_joker_value % 13) + 1
                                 message = f"Joker main => valeur {hand_joker_value}"
-                                append_debug(f"hand joker value -> {hand_joker_value}")
                                 break
                         else:
-                            # Right-click on table joker tile -> cycle assigned_value
+                            # table joker cycles its assigned value
                             for th in tile_hits:
                                 if th.rect.collidepoint(event.pos):
                                     if edited_table.melds[th.meld_idx].slots[th.slot_idx].tile_id == JOKER_ID:
                                         cycle_table_joker_value(th.meld_idx, th.slot_idx)
-                                        append_debug(f"table joker cycled at meld={th.meld_idx}, slot={th.slot_idx}")
                                     break
 
             pygame.display.flip()
             clock.tick(60)
 
-    try:
-        run_loop()
+        pygame.quit()
     except Exception:
-        # Keep window open and display the traceback to avoid "silent close"
-        tb = traceback.format_exc()
-        lines = tb.splitlines()[-40:]
-        W, H = screen.get_size()
-        while True:
-            screen.fill((15, 18, 23))
-            title = title_font.render("GUI crashed — traceback:", True, ERR)
-            screen.blit(title, (20, 20))
-            y = 60
-            for ln in lines:
-                s = small_font.render(ln[:180], True, (230, 230, 230))
-                screen.blit(s, (20, y))
-                y += small_font.get_height() + 2
-                if y > H - 40:
-                    break
-            hint = small_font.render("Press ESC or close the window.", True, WARN)
-            screen.blit(hint, (20, H - 28))
-            pygame.display.flip()
-            for e in pygame.event.get():
-                if e.type == pygame.QUIT:
-                    pygame.quit()
-                    return
-                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
-                    pygame.quit()
-                    return
+        crash_screen(traceback.format_exc())
 
 
-if __name__ == "__main__":  # allows standalone execution
+if __name__ == "__main__":
     launch_gui()
