@@ -813,6 +813,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             group_map = map_groups_cells_to_meld_indices(edited_table)
             nblocks = group_block_count(edited_table)
             tile_hits = []
+            meld_bounds: Dict[int, pygame.Rect] = {}
 
             # RUNS grid
             runs_row_hits = []
@@ -864,6 +865,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         border = ACCENT if is_new else None
                         draw_tile(screen, rect, s, small_font, highlight_border=border)
                         tile_hits.append(TileHit(rect=rect, meld_idx=meld_idx, slot_idx=slot_idx))
+                        if meld_idx in meld_bounds:
+                            meld_bounds[meld_idx].union_ip(rect)
+                        else:
+                            meld_bounds[meld_idx] = rect.copy()
 
             # GROUPS blocks
             groups_col_hits = []
@@ -917,6 +922,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                     border = ACCENT if is_new else None
                     draw_tile(screen, rect, s, small_font, highlight_border=border)
                     tile_hits.append(TileHit(rect=rect, meld_idx=meld_idx, slot_idx=slot_idx))
+                    if meld_idx in meld_bounds:
+                        meld_bounds[meld_idx].union_ip(rect)
+                    else:
+                        meld_bounds[meld_idx] = rect.copy()
 
             # HAND grid
             draw_panel(screen, hand_panel)
@@ -998,6 +1007,11 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             # Status bar
             right = f"À jouer : Joueur {p + 1}  |  {opening_txt}"
             status_bar(screen, status, message, right, small_font)
+
+            if show_debug and meld_bounds:
+                for rect in meld_bounds.values():
+                    outline = rect.inflate(6, 6)
+                    pygame.draw.rect(screen, (255, 255, 255), outline, width=2, border_radius=8)
 
             # Debug/Godmode overlay (restored)
             if show_debug:
