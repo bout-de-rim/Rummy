@@ -255,19 +255,39 @@ def _run_color_for_meld(m: Meld) -> int:
     return 0
 
 
-def map_runs_rows_to_meld_indices(table: Table) -> Dict[int, int]:
-    rows: Dict[int, int] = {}
-    per_color: Dict[int, List[int]] = {0: [], 1: [], 2: [], 3: []}
+def _run_value_range(meld: Meld) -> Tuple[int, int]:
+    values = [v for v in (_tile_value(s) for s in meld.slots) if v is not None]
+    if not values:
+        return (1, 1)
+    return (min(values), max(values))
+
+
+def map_runs_rows_to_meld_indices(table: Table) -> Dict[int, List[int]]:
+    rows: Dict[int, List[int]] = {i: [] for i in range(8)}
+    per_color: Dict[int, List[Tuple[int, Tuple[int, int]]]] = {0: [], 1: [], 2: [], 3: []}
     for idx, m in enumerate(table.melds):
         if m.kind != MeldKind.RUN or not m.slots:
             continue
         c = _run_color_for_meld(m)
-        per_color.setdefault(c, []).append(idx)
+        per_color.setdefault(c, []).append((idx, _run_value_range(m)))
+
     for color in range(4):
         idxs = per_color.get(color, [])
-        for k, meld_idx in enumerate(idxs[:2]):
-            row = color * 2 + k
-            rows[row] = meld_idx
+        idxs.sort(key=lambda item: (item[1][0], item[1][1]))
+        row_slots = {color * 2: [], color * 2 + 1: []}
+        for meld_idx, (vmin, vmax) in idxs:
+            placed = False
+            for row in (color * 2, color * 2 + 1):
+                overlaps = any(not (vmax < a or vmin > b) for a, b in row_slots[row])
+                if not overlaps:
+                    row_slots[row].append((vmin, vmax))
+                    rows[row].append(meld_idx)
+                    placed = True
+                    break
+            if not placed:
+                row = min((color * 2, color * 2 + 1), key=lambda r: len(row_slots[r]))
+                row_slots[row].append((vmin, vmax))
+                rows[row].append(meld_idx)
     return rows
 
 
@@ -632,7 +652,13 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             row = a
             row_color = row // 2
             row_map = map_runs_rows_to_meld_indices(edited_table)
-            meld_idx = row_map.get(row)
+            meld_candidates = row_map.get(row, [])
+            meld_idx = None
+            for candidate_idx in meld_candidates:
+                ok, _ = can_insert_into_run(edited_table.melds[candidate_idx].slots, slot, row_color)
+                if ok:
+                    meld_idx = candidate_idx
+                    break
             if meld_idx is None:
                 ok, why = can_insert_into_run([], slot, row_color)
                 if not ok:
@@ -806,21 +832,22 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 pygame.draw.rect(screen, COLOR_PALETTE[r // 2], sw, border_radius=3)
 
             # Draw run tiles by value column
-            for row, meld_idx in row_map.items():
-                meld = edited_table.melds[meld_idx]
-                for slot_idx, s in enumerate(meld.slots):
-                    v = _tile_value(s)
-                    if not v:
-                        continue
-                    col = _clamp(v - 1, 0, 12)
-                    cx = grid_x + col * cell_w + (cell_w - tile_w) / 2
-                    cy = grid_y + row * cell_h + (cell_h - tile_h) / 2
-                    rect = pygame.Rect(int(cx), int(cy), tile_w, tile_h)
+            for row, meld_idxs in row_map.items():
+                for meld_idx in meld_idxs:
+                    meld = edited_table.melds[meld_idx]
+                    for slot_idx, s in enumerate(meld.slots):
+                        v = _tile_value(s)
+                        if not v:
+                            continue
+                        col = _clamp(v - 1, 0, 12)
+                        cx = grid_x + col * cell_w + (cell_w - tile_w) / 2
+                        cy = grid_y + row * cell_h + (cell_h - tile_h) / 2
+                        rect = pygame.Rect(int(cx), int(cy), tile_w, tile_h)
 
-                    is_new = _is_slot_new_by_occurrence(s, base_counts, seen_for_new)
-                    border = ACCENT if is_new else None
-                    draw_tile(screen, rect, s, small_font, highlight_border=border)
-                    tile_hits.append(TileHit(rect=rect, meld_idx=meld_idx, slot_idx=slot_idx))
+                        is_new = _is_slot_new_by_occurrence(s, base_counts, seen_for_new)
+                        border = ACCENT if is_new else None
+                        draw_tile(screen, rect, s, small_font, highlight_border=border)
+                        tile_hits.append(TileHit(rect=rect, meld_idx=meld_idx, slot_idx=slot_idx))
 
             # GROUPS blocks
             groups_col_hits = []
