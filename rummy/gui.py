@@ -570,8 +570,17 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     def _perform_draw_action():
         nonlocal edited_table, message, pending_draw_confirm, time_idx
         before = current()
-        move = Move.draw()
-        nxt = apply_move(before, move)
+        if before.deck_index >= len(before.deck_order):
+            move = Move.skip()
+            message = "Pioche impossible: PASS."
+        else:
+            move = Move.draw()
+        try:
+            nxt = apply_move(before, move)
+        except ValueError as exc:
+            pending_draw_confirm = False
+            message = f"Pioche impossible: {exc}"
+            return
 
         if time_idx != len(timeline) - 1:
             timeline[:] = timeline[: time_idx + 1]

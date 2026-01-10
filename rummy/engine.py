@@ -62,6 +62,8 @@ def is_legal_move(state: GameState, move: Move) -> Tuple[bool, str]:
         return True, ""
 
     if move.kind == MoveKind.PASS:
+        if state.deck_index >= len(state.deck_order):
+            return True, ""
         return False, "pass move is not allowed"
 
     if move.kind != MoveKind.PLAY or move.payload is None:
