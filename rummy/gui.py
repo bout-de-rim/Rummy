@@ -661,7 +661,14 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             row = a
             row_color = row // 2
             row_map = map_runs_rows_to_meld_indices(edited_table)
-            meld_candidates = row_map.get(row, [])
+            other_row = row_color * 2 + (1 if row == row_color * 2 else 0)
+            meld_candidates = []
+            for candidate_idx in row_map.get(row, []):
+                if candidate_idx not in meld_candidates:
+                    meld_candidates.append(candidate_idx)
+            for candidate_idx in row_map.get(other_row, []):
+                if candidate_idx not in meld_candidates:
+                    meld_candidates.append(candidate_idx)
             meld_idx = None
             for candidate_idx in meld_candidates:
                 ok, _ = can_insert_into_run(edited_table.melds[candidate_idx].slots, slot, row_color)
