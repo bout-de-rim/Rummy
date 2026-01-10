@@ -114,7 +114,7 @@ PANEL = (30, 36, 46)
 PANEL_LINE = (54, 63, 77)
 TEXT = (220, 226, 235)
 SUB = (164, 174, 187)
-ACCENT = (88, 138, 255)
+ACCENT = (255, 105, 180)
 HILITE_NEW = (64, 255, 255)  # last drawn / emphasis
 ERR = (235, 87, 87)
 WARN = (255, 170, 40)
@@ -528,6 +528,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     show_debug = False
     show_help = False
     pending_draw_confirm = False
+    invalid_melds: set[int] = set()
     debug_scroll = 10**9
     debug_log: List[str] = []
     hand_joker_value = 1
@@ -543,11 +544,12 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     tile_hits: List[TileHit] = []
 
     def reset_draft():
-        nonlocal edited_table, selected_target, drag, pending_draw_confirm
+        nonlocal edited_table, selected_target, drag, pending_draw_confirm, invalid_melds
         edited_table = current().table.canonicalize()
         selected_target = None
         drag = None
         pending_draw_confirm = False
+        invalid_melds = set()
 
     def _draft_delta_from_hand(state: GameState, table: Table) -> Optional[TileMultiset]:
         non_empty = Table([meld for meld in table.melds if meld.slots])
@@ -568,7 +570,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         return canonical_table == base_table
 
     def _perform_draw_action():
-        nonlocal edited_table, message, pending_draw_confirm, time_idx
+        nonlocal edited_table, message, pending_draw_confirm, time_idx, invalid_melds
         before = current()
         if before.deck_index >= len(before.deck_order):
             move = Move.skip()
@@ -588,6 +590,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         time_idx = len(timeline) - 1
         edited_table = current().table.canonicalize()
         pending_draw_confirm = False
+        invalid_melds = set()
         message = "Pioche effectuée."
 
     def crash_screen(tb: str):
@@ -704,7 +707,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         return True, ""
 
     def try_place_from_hand(tile_id: int):
-        nonlocal message, pending_draw_confirm
+        nonlocal message, pending_draw_confirm, invalid_melds
         if selected_target is None:
             message = "Aucun meld sélectionné."
             return
@@ -719,6 +722,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         if ok:
             message = "Tuile placée."
             pending_draw_confirm = False
+            invalid_melds = set()
         else:
             message = f"Placement refusé: {why}"
 
@@ -814,6 +818,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             nblocks = group_block_count(edited_table)
             tile_hits = []
             meld_bounds: Dict[int, pygame.Rect] = {}
+            meld_tile_bounds: Dict[int, pygame.Rect] = {}
 
             # RUNS grid
             runs_row_hits = []
@@ -869,6 +874,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             meld_bounds[meld_idx].union_ip(rect)
                         else:
                             meld_bounds[meld_idx] = rect.copy()
+                        if meld_idx in meld_tile_bounds:
+                            meld_tile_bounds[meld_idx].union_ip(rect)
+                        else:
+                            meld_tile_bounds[meld_idx] = rect.copy()
 
             # GROUPS blocks
             groups_col_hits = []
@@ -926,6 +935,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         meld_bounds[meld_idx].union_ip(rect)
                     else:
                         meld_bounds[meld_idx] = rect.copy()
+                    if meld_idx in meld_tile_bounds:
+                        meld_tile_bounds[meld_idx].union_ip(rect)
+                    else:
+                        meld_tile_bounds[meld_idx] = rect.copy()
 
             # HAND grid
             draw_panel(screen, hand_panel)
@@ -1008,10 +1021,13 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             right = f"À jouer : Joueur {p + 1}  |  {opening_txt}"
             status_bar(screen, status, message, right, small_font)
 
-            if show_debug and meld_bounds:
-                for rect in meld_bounds.values():
+            if meld_bounds:
+                for meld_idx, rect in meld_bounds.items():
                     outline = rect.inflate(6, 6)
-                    pygame.draw.rect(screen, (255, 255, 255), outline, width=2, border_radius=8)
+                    if meld_idx in invalid_melds:
+                        pygame.draw.rect(screen, ERR, outline, width=3, border_radius=8)
+                    elif show_debug:
+                        pygame.draw.rect(screen, (255, 255, 255), outline, width=2, border_radius=8)
 
             # Debug/Godmode overlay (restored)
             if show_debug:
@@ -1190,10 +1206,16 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             time_idx = len(timeline) - 1
                             edited_table = current().table.canonicalize()
                             pending_draw_confirm = False
+                            invalid_melds = set()
                             message = "PLAY effectué."
                         else:
                             message = f"PLAY invalide: {err}"
                             debug_log.append(f"PLAY invalid: {err}")
+                            invalid_melds = set()
+                            for idx, meld in enumerate(edited_table.melds):
+                                ok, _ = meld.is_valid()
+                                if not ok:
+                                    invalid_melds.add(idx)
                     elif event.key == pygame.K_d:
                         _perform_draw_action()
                     elif event.key == pygame.K_r:
