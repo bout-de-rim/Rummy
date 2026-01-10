@@ -740,7 +740,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             if slot_value is None:
                 return False, "joker has no value"
             base_table = current().table.canonicalize()
-            new_only_melds = _new_only_meld_indices(base_table, edited_table)
+            if current().initial_meld_done[current().current_player]:
+                new_only_melds = None
+            else:
+                new_only_melds = _new_only_meld_indices(base_table, edited_table)
             row_map = map_runs_rows_to_meld_indices(edited_table)
             other_row = row_color * 2 + (1 if row == row_color * 2 else 0)
             meld_candidates: List[int] = []
@@ -753,7 +756,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
 
             touching: List[int] = []
             for candidate_idx in meld_candidates:
-                if candidate_idx not in new_only_melds:
+                if new_only_melds is not None and candidate_idx not in new_only_melds:
                     continue
                 vmin, vmax = _run_value_range(edited_table.melds[candidate_idx])
                 if slot_value in (vmin - 1, vmax + 1):
