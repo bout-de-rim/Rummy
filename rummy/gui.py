@@ -655,9 +655,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         v = existing.assigned_value if existing.assigned_value is not None else hand_joker_value
         return TileSlot(JOKER_ID, assigned_color=row_color, assigned_value=v)
 
-    def _insert_slot_into_target(
-        slot: TileSlot, target: Tuple[str, int, int], prefer_new_meld: bool = False
-    ) -> Tuple[bool, str]:
+    def _insert_slot_into_target(slot: TileSlot, target: Tuple[str, int, int]) -> Tuple[bool, str]:
         """Try to insert slot into target meld; create meld if needed."""
         nonlocal edited_table
         kind, a, b = target
@@ -665,38 +663,60 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         if kind == "run":
             row = a
             row_color = row // 2
-            if prefer_new_meld:
-                ok, why = can_insert_into_run([], slot, row_color)
-                if not ok:
-                    return False, why
-                edited_table.melds.append(Meld(kind=MeldKind.RUN, slots=[slot]))
-                return True, ""
+            slot_value = _tile_value(slot)
+            if slot_value is None:
+                return False, "joker has no value"
             row_map = map_runs_rows_to_meld_indices(edited_table)
             other_row = row_color * 2 + (1 if row == row_color * 2 else 0)
-            meld_candidates = []
+            meld_candidates: List[int] = []
             for candidate_idx in row_map.get(row, []):
                 if candidate_idx not in meld_candidates:
                     meld_candidates.append(candidate_idx)
             for candidate_idx in row_map.get(other_row, []):
                 if candidate_idx not in meld_candidates:
                     meld_candidates.append(candidate_idx)
-            meld_idx = None
+
+            touching: List[int] = []
             for candidate_idx in meld_candidates:
-                ok, _ = can_insert_into_run(edited_table.melds[candidate_idx].slots, slot, row_color)
-                if ok:
-                    meld_idx = candidate_idx
-                    break
-            if meld_idx is None:
+                vmin, vmax = _run_value_range(edited_table.melds[candidate_idx])
+                if slot_value in (vmin - 1, vmax + 1):
+                    touching.append(candidate_idx)
+
+            if not touching:
                 ok, why = can_insert_into_run([], slot, row_color)
                 if not ok:
                     return False, why
                 edited_table.melds.append(Meld(kind=MeldKind.RUN, slots=[slot]))
                 return True, ""
-            ok, why = can_insert_into_run(edited_table.melds[meld_idx].slots, slot, row_color)
-            if not ok:
-                return False, why
-            edited_table.melds[meld_idx].slots.append(slot)
-            return True, ""
+
+            if len(touching) >= 2:
+                touching_sorted = sorted(touching, key=lambda idx: _run_value_range(edited_table.melds[idx])[0])
+                for i in range(len(touching_sorted) - 1):
+                    first_idx = touching_sorted[i]
+                    second_idx = touching_sorted[i + 1]
+                    first_range = _run_value_range(edited_table.melds[first_idx])
+                    second_range = _run_value_range(edited_table.melds[second_idx])
+                    if slot_value == first_range[1] + 1 and slot_value == second_range[0] - 1:
+                        combined_slots = (
+                            edited_table.melds[first_idx].slots
+                            + edited_table.melds[second_idx].slots
+                        )
+                        ok, why = can_insert_into_run(combined_slots, slot, row_color)
+                        if not ok:
+                            return False, why
+                        for idx in sorted([first_idx, second_idx], reverse=True):
+                            edited_table.melds.pop(idx)
+                        edited_table.melds.append(
+                            Meld(kind=MeldKind.RUN, slots=combined_slots + [slot])
+                        )
+                        return True, ""
+
+            for candidate_idx in touching:
+                ok, _ = can_insert_into_run(edited_table.melds[candidate_idx].slots, slot, row_color)
+                if ok:
+                    edited_table.melds[candidate_idx].slots.append(slot)
+                    return True, ""
+            return False, "run not consecutive"
 
         # group
         block, value_idx = a, b
@@ -726,8 +746,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             slot = TileSlot(JOKER_ID, assigned_color=None, assigned_value=hand_joker_value)
             slot = _adapt_slot_for_target(slot, selected_target)
 
-        prefer_new = selected_target[0] == "run"
-        ok, why = _insert_slot_into_target(slot, selected_target, prefer_new_meld=prefer_new)
+        ok, why = _insert_slot_into_target(slot, selected_target)
         if ok:
             message = "Tuile placée."
             pending_draw_confirm = False
@@ -1358,17 +1377,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             dropped_to_hand = True
 
                         # run row drop?
-                        drop_prefer_new = False
-                        drop_row_melds: set[int] = set()
                         for rr in runs_row_hits:
                             if rr.rect.collidepoint(event.pos):
                                 drop_target = ("run", rr.row, -1)
-                                drop_row_melds = set(row_map.get(rr.row, []))
-                                if drop_row_melds:
-                                    drop_prefer_new = not any(
-                                        th.rect.collidepoint(event.pos) and th.meld_idx in drop_row_melds
-                                        for th in tile_hits
-                                    )
                                 break
                         # group column drop?
                         if drop_target is None:
@@ -1391,7 +1402,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                                 slot = drag.slot
                                 if slot.tile_id == JOKER_ID:
                                     slot = _adapt_slot_for_target(slot, drop_target)
-                                ok, why = _insert_slot_into_target(slot, drop_target, prefer_new_meld=drop_prefer_new)
+                                ok, why = _insert_slot_into_target(slot, drop_target)
                                 message = "Tuile placée." if ok else f"Placement refusé: {why}"
                                 if ok:
                                     pending_draw_confirm = False
@@ -1412,7 +1423,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                                 except Exception:
                                     removed = slot
                                 moved = _adapt_slot_for_target(removed, drop_target)
-                                ok, why = _insert_slot_into_target(moved, drop_target, prefer_new_meld=drop_prefer_new)
+                                ok, why = _insert_slot_into_target(moved, drop_target)
                                 if not ok:
                                     # rollback: put it back in its original meld if possible
                                     # easiest: append to end of same kind meld in edited_table (best effort)
