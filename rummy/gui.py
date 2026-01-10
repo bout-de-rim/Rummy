@@ -31,7 +31,7 @@ import traceback
 try:
     from .engine import apply_move, is_legal_move
     from .meld import Meld, MeldKind
-    from .move import Move
+    from .move import Move, MoveKind
     from .multiset import TileMultiset
     from .rules import Ruleset
     from .state import GameState, new_game
@@ -40,7 +40,7 @@ try:
 except Exception:  # fallback when executed as a script
     from engine import apply_move, is_legal_move
     from meld import Meld, MeldKind
-    from move import Move
+    from move import Move, MoveKind
     from multiset import TileMultiset
     from rules import Ruleset
     from state import GameState, new_game
@@ -185,31 +185,6 @@ def _points_for_slot(slot: TileSlot) -> int:
     return int(v or 0)
 
 
-# --- Open/starting period detection -------------------------------------------
-
-def _detect_opened_mask(state: GameState) -> Optional[List[bool]]:
-    """Best-effort detection of per-player 'opened/initial meld done' flags from the engine's GameState."""
-    n = len(getattr(state, "hands", []))
-    candidates = [
-        "opened", "has_opened", "opened_players", "opened_mask",
-        "initial_meld_done", "initial_meld_played", "has_made_initial_meld",
-        "has_opened_meld", "opened_flags",
-    ]
-    for name in candidates:
-        v = getattr(state, name, None)
-        if v is None:
-            continue
-        if isinstance(v, (list, tuple)) and len(v) == n:
-            return [bool(x) for x in v]
-        if isinstance(v, set):
-            return [i in v for i in range(n)]
-        if isinstance(v, dict):
-            return [bool(v.get(i, False)) for i in range(n)]
-        if isinstance(v, int):
-            return [((v >> i) & 1) == 1 for i in range(n)]
-    return None
-
-
 def _draft_points_toward_opening(base_table: Table, edited_table: Table) -> int:
     """Sum points of tiles newly added to the table compared to base_table, using joker assignments on the edited table."""
     base_counts = base_table.multiset().counts
@@ -226,6 +201,15 @@ def _draft_points_toward_opening(base_table: Table, edited_table: Table) -> int:
             if occ_seen[tid] > base_counts[tid]:
                 pts += _points_for_slot(s)
     return pts
+
+
+def _last_drawn_tile_for_player(state: GameState, player: int) -> Optional[int]:
+    for event in reversed(state.event_log):
+        if event.player != player:
+            continue
+        if event.move_kind == MoveKind.DRAW.value:
+            return event.payload.get("tile")
+    return None
 
 
 # --- Hit testing structures ----------------------------------------------------
@@ -510,9 +494,6 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     timeline: List[GameState] = [state]
     time_idx = 0
 
-    # per-state metadata (for "last drawn tile")
-    last_drawn_by_state: Dict[int, Tuple[int, int]] = {}  # state_index -> (player_idx, tile_id)
-
     def current() -> GameState:
         return timeline[time_idx]
 
@@ -522,6 +503,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     selected_target: Optional[Tuple[str, int, int]] = None  # ('run', row, -1) or ('group', block, value_idx)
     message = "Glisser/déposer: main ↔ plateau. Ou sélectionnez un RUN/GROUP puis cliquez une tuile."
     show_debug = False
+    show_help = False
+    pending_draw_confirm = False
     debug_scroll = 10**9
     debug_log: List[str] = []
     hand_joker_value = 1
@@ -537,10 +520,43 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     tile_hits: List[TileHit] = []
 
     def reset_draft():
-        nonlocal edited_table, selected_target, drag
+        nonlocal edited_table, selected_target, drag, pending_draw_confirm
         edited_table = current().table.canonicalize()
         selected_target = None
         drag = None
+        pending_draw_confirm = False
+
+    def _draft_delta_from_hand(state: GameState, table: Table) -> Optional[TileMultiset]:
+        non_empty = Table([meld for meld in table.melds if meld.slots])
+        canonical_table, error = _safe_canonical_table(non_empty)
+        if canonical_table is None:
+            return None
+        delta, error = compute_delta_from_tables(state.table.canonicalize(), canonical_table)
+        if delta is None:
+            return None
+        return delta
+
+    def _is_noop_draft(state: GameState, table: Table) -> bool:
+        non_empty = Table([meld for meld in table.melds if meld.slots])
+        canonical_table, error = _safe_canonical_table(non_empty)
+        if canonical_table is None:
+            return False
+        base_table = state.table.canonicalize()
+        return canonical_table == base_table
+
+    def _perform_draw_action():
+        nonlocal edited_table, message, pending_draw_confirm, time_idx
+        before = current()
+        move = Move.draw()
+        nxt = apply_move(before, move)
+
+        if time_idx != len(timeline) - 1:
+            timeline[:] = timeline[: time_idx + 1]
+        timeline.append(nxt)
+        time_idx = len(timeline) - 1
+        edited_table = current().table.canonicalize()
+        pending_draw_confirm = False
+        message = "Pioche effectuée."
 
     def crash_screen(tb: str):
         lines = tb.splitlines()[-40:]
@@ -643,7 +659,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         return True, ""
 
     def try_place_from_hand(tile_id: int):
-        nonlocal message
+        nonlocal message, pending_draw_confirm
         if selected_target is None:
             message = "Aucun meld sélectionné."
             return
@@ -657,6 +673,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         ok, why = _insert_slot_into_target(slot, selected_target)
         if ok:
             message = "Tuile placée."
+            pending_draw_confirm = False
         else:
             message = f"Placement refusé: {why}"
 
@@ -891,9 +908,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             hand_cells = []
 
             # last drawn highlight (if applicable)
-            last_drawn = last_drawn_by_state.get(time_idx)
-            last_drawn_player = last_drawn[0] if last_drawn else None
-            last_drawn_tile = last_drawn[1] if last_drawn else None
+            last_drawn_tile = _last_drawn_tile_for_player(current(), current().current_player)
 
             for r in range(hrows):
                 for c in range(hcols):
@@ -914,7 +929,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         slot = TileSlot(JOKER_ID, assigned_color=None, assigned_value=hand_joker_value) if rep == JOKER_ID else TileSlot(rep)
 
                         border = None
-                        if last_drawn and last_drawn_player == current().current_player and last_drawn_tile == rep:
+                        if last_drawn_tile == rep:
                             border = HILITE_NEW
 
                         # If dragging from this cell, hide the tile (visual)
@@ -925,17 +940,14 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             draw_tile(screen, main, slot, small_font, highlight_border=border, count_badge=count)
 
             # Opening indicator (status left)
-            opened_mask = _detect_opened_mask(current())
             p = current().current_player
-            is_opened = opened_mask[p] if opened_mask else None
+            is_opened = current().initial_meld_done[p]
             draft_pts = _draft_points_toward_opening(base_table, edited_table)
             opening_txt = ""
-            if is_opened is False:
+            if not is_opened:
                 opening_txt = f"Ouverture: {draft_pts}/30"
-            elif is_opened is True:
-                opening_txt = "Ouvert"
             else:
-                opening_txt = f"Ouverture?: {draft_pts}/30"
+                opening_txt = "Ouvert"
 
             # Status bar
             right = f"À jouer : Joueur {p + 1}  |  {opening_txt}"
@@ -1036,6 +1048,47 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 max_scroll = max(0, int(content_h - clip.height))
                 debug_scroll = _clamp(debug_scroll, 0, max_scroll)
 
+            help_close = None
+            # Help panel
+            if show_help:
+                overlay = pygame.Rect(int(W * 0.12), int(H * 0.18), int(W * 0.76), int(H * 0.64))
+                draw_panel(screen, overlay)
+                screen.blit(title_font.render("Aide", True, TEXT), (overlay.x + 16, overlay.y + 12))
+                lines = [
+                    "• Glisser/déposer : main ↔ plateau (RUN/GROUP).",
+                    "• Clic gauche : sélectionner RUN/GROUP si besoin.",
+                    "• Clic droit : cycler valeur du joker (main/plateau).",
+                    "• Enter / Play : valider un PLAY.",
+                    "• D / Draw : piocher.",
+                    "• R / Reset : annuler le draft.",
+                    "• G / Debug : godmode.",
+                    "• H / Help : fermer ce panneau.",
+                ]
+                y = overlay.y + 52
+                for ln in lines:
+                    screen.blit(small_font.render(ln, True, SUB), (overlay.x + 18, y))
+                    y += small_font.get_height() + 6
+                help_close = pygame.Rect(overlay.right - 140, overlay.bottom - 50, 120, 34)
+                draw_button(screen, help_close, "Fermer", font)
+
+            # Draw confirmation panel
+            confirm_rect = None
+            confirm_yes = None
+            confirm_no = None
+            if pending_draw_confirm:
+                overlay = pygame.Rect(int(W * 0.30), int(H * 0.35), int(W * 0.40), int(H * 0.24))
+                confirm_rect = overlay
+                draw_panel(screen, overlay)
+                screen.blit(title_font.render("Confirmer la pioche ?", True, TEXT), (overlay.x + 16, overlay.y + 16))
+                screen.blit(
+                    small_font.render("Aucun meld placé : un PLAY déclenchera une pioche.", True, SUB),
+                    (overlay.x + 16, overlay.y + 56),
+                )
+                confirm_yes = pygame.Rect(overlay.x + 20, overlay.bottom - 50, 140, 34)
+                confirm_no = pygame.Rect(overlay.right - 160, overlay.bottom - 50, 140, 34)
+                draw_button(screen, confirm_yes, "Confirmer", font)
+                draw_button(screen, confirm_no, "Annuler", font)
+
             # Drag ghost tile
             if drag is not None:
                 mx, my = pygame.mouse.get_pos()
@@ -1058,6 +1111,16 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                     if event.key == pygame.K_ESCAPE:
                         running = False
                     elif event.key == pygame.K_RETURN:
+                        if pending_draw_confirm:
+                            _perform_draw_action()
+                            continue
+
+                        delta = _draft_delta_from_hand(current(), edited_table)
+                        if delta is not None and delta.total() == 0 and _is_noop_draft(current(), edited_table):
+                            pending_draw_confirm = True
+                            message = "Confirmer la pioche."
+                            continue
+
                         move, err = build_play_move(current(), edited_table)
                         if move:
                             nxt = apply_move(current(), move)
@@ -1066,34 +1129,13 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             timeline.append(nxt)
                             time_idx = len(timeline) - 1
                             edited_table = current().table.canonicalize()
+                            pending_draw_confirm = False
                             message = "PLAY effectué."
                         else:
                             message = f"PLAY invalide: {err}"
                             debug_log.append(f"PLAY invalid: {err}")
                     elif event.key == pygame.K_d:
-                        before = current()
-                        move = Move.draw()
-                        nxt = apply_move(before, move)
-
-                        # detect drawn tile by hand delta across all players
-                        try:
-                            for pi in range(len(before.hands)):
-                                b = before.hands[pi].counts
-                                a = nxt.hands[pi].counts
-                                diffs = [ai - bi for ai, bi in zip(a, b)]
-                                if sum(diffs) > 0:
-                                    tid = diffs.index(max(diffs))
-                                    last_drawn_by_state[len(timeline)] = (pi, tid)
-                                    break
-                        except Exception:
-                            pass
-
-                        if time_idx != len(timeline) - 1:
-                            timeline[:] = timeline[: time_idx + 1]
-                        timeline.append(nxt)
-                        time_idx = len(timeline) - 1
-                        edited_table = current().table.canonicalize()
-                        message = "Pioche effectuée."
+                        _perform_draw_action()
                     elif event.key == pygame.K_r:
                         reset_draft()
                         message = "Draft réinitialisé."
@@ -1102,7 +1144,11 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         if show_debug:
                             debug_scroll = 10**9
                     elif event.key == pygame.K_h:
-                        message = "Aide: drag&drop main↔plateau; drop sur RUN ou GROUP. Clic droit joker: valeur. Enter PLAY. D pioche. R reset."
+                        show_help = not show_help
+                        if show_help:
+                            message = "Aide affichée."
+                        else:
+                            message = "Aide fermée."
                     elif event.key == pygame.K_LEFT:
                         if time_idx > 0:
                             time_idx -= 1
@@ -1116,6 +1162,20 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:
+                        if pending_draw_confirm and confirm_rect:
+                            if confirm_yes and confirm_yes.collidepoint(event.pos):
+                                _perform_draw_action()
+                            elif confirm_no and confirm_no.collidepoint(event.pos):
+                                pending_draw_confirm = False
+                                message = "Pioche annulée."
+                            elif btn_rects["play"].collidepoint(event.pos):
+                                _perform_draw_action()
+                            continue
+                        if show_help:
+                            if help_close and help_close.collidepoint(event.pos):
+                                show_help = False
+                                message = "Aide fermée."
+                            continue
                         # Buttons
                         if btn_rects["play"].collidepoint(event.pos):
                             pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
@@ -1234,6 +1294,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                                     slot = _adapt_slot_for_target(slot, drop_target)
                                 ok, why = _insert_slot_into_target(slot, drop_target)
                                 message = "Tuile placée." if ok else f"Placement refusé: {why}"
+                                if ok:
+                                    pending_draw_confirm = False
                             else:
                                 # move within table: remove then insert (rollback on failure)
                                 assert drag.meld_idx is not None and drag.slot_idx is not None
