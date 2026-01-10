@@ -72,12 +72,17 @@ def compute_delta_from_tables(base_table: Table, edited_table: Table) -> Tuple[O
 
 
 def build_play_move(state: GameState, edited_table: Table) -> Tuple[Optional[Move], str]:
+    base_table = state.table.canonicalize()
+    draft_points = _draft_points_toward_opening(base_table, edited_table)
+    if not state.initial_meld_done[state.current_player]:
+        if draft_points >= state.ruleset.initial_meld_min_points:
+            edited_table = _merge_new_run_melds_for_opening(state, edited_table)
     non_empty = Table([meld for meld in edited_table.melds if meld.slots])
     canonical_table, error = _safe_canonical_table(non_empty)
     if canonical_table is None:
         return None, error
 
-    delta, error = compute_delta_from_tables(state.table.canonicalize(), canonical_table)
+    delta, error = compute_delta_from_tables(base_table, canonical_table)
     if delta is None:
         return None, error
 
@@ -201,6 +206,55 @@ def _draft_points_toward_opening(base_table: Table, edited_table: Table) -> int:
             if occ_seen[tid] > base_counts[tid]:
                 pts += _points_for_slot(s)
     return pts
+
+
+def _merge_new_run_melds_for_opening(state: GameState, edited_table: Table) -> Table:
+    base_table = state.table.canonicalize()
+    base_counts = base_table.multiset().counts
+    seen = [0] * len(base_counts)
+    new_run_slots_by_color: Dict[int, List[TileSlot]] = {0: [], 1: [], 2: [], 3: []}
+    kept_melds: List[Meld] = []
+
+    for meld in edited_table.melds:
+        meld_new_flags: List[bool] = []
+        for s in meld.slots:
+            tid = s.tile_id
+            if 0 <= tid < len(base_counts):
+                seen[tid] += 1
+                is_new = seen[tid] > base_counts[tid]
+            else:
+                is_new = False
+            meld_new_flags.append(is_new)
+        if meld.kind == MeldKind.RUN and meld.slots and all(meld_new_flags):
+            color = _run_color_for_meld(meld)
+            new_run_slots_by_color[color].extend(meld.slots)
+        else:
+            kept_melds.append(meld)
+
+    for color, slots in new_run_slots_by_color.items():
+        if not slots:
+            continue
+        slots_sorted = sorted(slots, key=lambda s: _tile_value(s) or 0)
+        current: List[TileSlot] = []
+        prev_val: Optional[int] = None
+        for s in slots_sorted:
+            v = _tile_value(s)
+            if v is None:
+                if current:
+                    kept_melds.append(Meld(kind=MeldKind.RUN, slots=current))
+                current = [s]
+                prev_val = v
+                continue
+            if prev_val is None or v == prev_val + 1:
+                current.append(s)
+            else:
+                kept_melds.append(Meld(kind=MeldKind.RUN, slots=current))
+                current = [s]
+            prev_val = v
+        if current:
+            kept_melds.append(Meld(kind=MeldKind.RUN, slots=current))
+
+    return Table(kept_melds)
 
 
 def _last_drawn_tile_for_player(state: GameState, player: int) -> Optional[int]:
@@ -666,6 +720,12 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             slot_value = _tile_value(slot)
             if slot_value is None:
                 return False, "joker has no value"
+            if not current().initial_meld_done[current().current_player]:
+                ok, why = can_insert_into_run([], slot, row_color)
+                if not ok:
+                    return False, why
+                edited_table.melds.append(Meld(kind=MeldKind.RUN, slots=[slot]))
+                return True, ""
             row_map = map_runs_rows_to_meld_indices(edited_table)
             other_row = row_color * 2 + (1 if row == row_color * 2 else 0)
             meld_candidates: List[int] = []
