@@ -208,6 +208,25 @@ def _draft_points_toward_opening(base_table: Table, edited_table: Table) -> int:
     return pts
 
 
+def _new_only_meld_indices(base_table: Table, edited_table: Table) -> set[int]:
+    base_counts = base_table.multiset().counts
+    seen = [0] * len(base_counts)
+    new_only: set[int] = set()
+    for idx, meld in enumerate(edited_table.melds):
+        meld_new_flags: List[bool] = []
+        for s in meld.slots:
+            tid = s.tile_id
+            if 0 <= tid < len(base_counts):
+                seen[tid] += 1
+                is_new = seen[tid] > base_counts[tid]
+            else:
+                is_new = False
+            meld_new_flags.append(is_new)
+        if meld_new_flags and all(meld_new_flags):
+            new_only.add(idx)
+    return new_only
+
+
 def _merge_new_run_melds_for_opening(state: GameState, edited_table: Table) -> Table:
     base_table = state.table.canonicalize()
     base_counts = base_table.multiset().counts
@@ -720,12 +739,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             slot_value = _tile_value(slot)
             if slot_value is None:
                 return False, "joker has no value"
-            if not current().initial_meld_done[current().current_player]:
-                ok, why = can_insert_into_run([], slot, row_color)
-                if not ok:
-                    return False, why
-                edited_table.melds.append(Meld(kind=MeldKind.RUN, slots=[slot]))
-                return True, ""
+            base_table = current().table.canonicalize()
+            new_only_melds = _new_only_meld_indices(base_table, edited_table)
             row_map = map_runs_rows_to_meld_indices(edited_table)
             other_row = row_color * 2 + (1 if row == row_color * 2 else 0)
             meld_candidates: List[int] = []
@@ -738,6 +753,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
 
             touching: List[int] = []
             for candidate_idx in meld_candidates:
+                if candidate_idx not in new_only_melds:
+                    continue
                 vmin, vmax = _run_value_range(edited_table.melds[candidate_idx])
                 if slot_value in (vmin - 1, vmax + 1):
                     touching.append(candidate_idx)
