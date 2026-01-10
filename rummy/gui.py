@@ -115,7 +115,7 @@ PANEL_LINE = (54, 63, 77)
 TEXT = (220, 226, 235)
 SUB = (164, 174, 187)
 ACCENT = (88, 138, 255)
-HILITE_NEW = (255, 170, 40)  # last drawn / emphasis
+HILITE_NEW = (64, 255, 255)  # last drawn / emphasis
 ERR = (235, 87, 87)
 WARN = (255, 170, 40)
 
@@ -425,6 +425,9 @@ def draw_tile(
 
     border = highlight_border if highlight_border is not None else (60, 70, 85)
     pygame.draw.rect(surface, bg, rect, border_radius=radius)
+    if highlight_border == HILITE_NEW:
+        outer = rect.inflate(8, 8)
+        pygame.draw.rect(surface, highlight_border, outer, width=3, border_radius=radius + 2)
     pygame.draw.rect(surface, border, rect, width=3 if highlight_border else 2, border_radius=radius)
 
     inner = rect.inflate(-8, -8)
