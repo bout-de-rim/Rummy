@@ -728,6 +728,27 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         v = existing.assigned_value if existing.assigned_value is not None else hand_joker_value
         return TileSlot(JOKER_ID, assigned_color=row_color, assigned_value=v)
 
+    def _assign_joker_for_run(
+        slot: TileSlot,
+        row_color: int,
+        touching_ranges: List[Tuple[int, int]],
+    ) -> TileSlot:
+        nonlocal hand_joker_value
+        if slot.tile_id != JOKER_ID:
+            return slot
+        candidates: List[int] = []
+        for vmin, vmax in touching_ranges:
+            candidates.extend([vmin - 1, vmax + 1])
+        candidates = [v for v in candidates if 1 <= v <= 13]
+        chosen: Optional[int] = None
+        if slot.assigned_value in candidates:
+            chosen = slot.assigned_value
+        elif candidates:
+            chosen = candidates[0]
+        else:
+            chosen = slot.assigned_value or hand_joker_value
+        return TileSlot(JOKER_ID, assigned_color=row_color, assigned_value=chosen)
+
     def _insert_slot_into_target(slot: TileSlot, target: Tuple[str, int, int]) -> Tuple[bool, str]:
         """Try to insert slot into target meld; create meld if needed."""
         nonlocal edited_table
@@ -736,9 +757,6 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         if kind == "run":
             row = a
             row_color = row // 2
-            slot_value = _tile_value(slot)
-            if slot_value is None:
-                return False, "joker has no value"
             base_table = current().table.canonicalize()
             if current().initial_meld_done[current().current_player]:
                 new_only_melds = None
@@ -754,11 +772,21 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 if candidate_idx not in meld_candidates:
                     meld_candidates.append(candidate_idx)
 
-            touching: List[int] = []
+            candidate_ranges: List[Tuple[int, int, int]] = []
             for candidate_idx in meld_candidates:
                 if new_only_melds is not None and candidate_idx not in new_only_melds:
                     continue
                 vmin, vmax = _run_value_range(edited_table.melds[candidate_idx])
+                candidate_ranges.append((candidate_idx, vmin, vmax))
+
+            touching_ranges = [(vmin, vmax) for _, vmin, vmax in candidate_ranges]
+            slot = _assign_joker_for_run(slot, row_color, touching_ranges)
+            slot_value = _tile_value(slot)
+            if slot_value is None:
+                return False, "joker has no value"
+
+            touching: List[int] = []
+            for candidate_idx, vmin, vmax in candidate_ranges:
                 if slot_value in (vmin - 1, vmax + 1):
                     touching.append(candidate_idx)
 
@@ -792,6 +820,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         return True, ""
 
             for candidate_idx in touching:
+                vmin, vmax = _run_value_range(edited_table.melds[candidate_idx])
+                if slot_value not in (vmin - 1, vmax + 1):
+                    continue
                 ok, _ = can_insert_into_run(edited_table.melds[candidate_idx].slots, slot, row_color)
                 if ok:
                     edited_table.melds[candidate_idx].slots.append(slot)
@@ -802,6 +833,11 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         block, value_idx = a, b
         mapping = map_groups_cells_to_meld_indices(edited_table)
         meld_idx = mapping.get((block, value_idx))
+        if meld_idx is not None and not current().initial_meld_done[current().current_player]:
+            base_table = current().table.canonicalize()
+            new_only_melds = _new_only_meld_indices(base_table, edited_table)
+            if meld_idx not in new_only_melds:
+                return False, "meld non autorisé avant ouverture"
         if meld_idx is None:
             ok, why = can_insert_into_group([], slot, value_idx)
             if not ok:
@@ -851,6 +887,14 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 if mi == meld_idx and si == slot_idx:
                     return is_new
         return False
+
+    def _clone_table(table: Table) -> Table:
+        return Table([Meld(kind=m.kind, slots=list(m.slots)) for m in table.melds])
+
+    def _can_move_table_tile(meld_idx: int, slot_idx: int) -> bool:
+        if current().initial_meld_done[current().current_player]:
+            return True
+        return _slot_can_return_to_hand(meld_idx, slot_idx)
 
     def cycle_table_joker_value(meld_idx: int, slot_idx: int):
         nonlocal edited_table, message
@@ -1387,6 +1431,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         started = False
                         for th in tile_hits:
                             if th.rect.collidepoint(event.pos):
+                                if not _can_move_table_tile(th.meld_idx, th.slot_idx):
+                                    message = "Déplacement refusé (avant ouverture)."
+                                    started = True
+                                    break
                                 s = edited_table.melds[th.meld_idx].slots[th.slot_idx]
                                 drag = DragPayload(
                                     source="table",
@@ -1489,6 +1537,11 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             else:
                                 # move within table: remove then insert (rollback on failure)
                                 assert drag.meld_idx is not None and drag.slot_idx is not None
+                                if not _can_move_table_tile(drag.meld_idx, drag.slot_idx):
+                                    message = "Déplacement refusé (avant ouverture)."
+                                    drag = None
+                                    continue
+                                snapshot = _clone_table(edited_table)
                                 orig_meld = drag.meld_idx
                                 orig_slot = drag.slot_idx
                                 # capture a fresh slot (indices may be stale if prior removals, but drag is immediate)
@@ -1505,12 +1558,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                                 moved = _adapt_slot_for_target(removed, drop_target)
                                 ok, why = _insert_slot_into_target(moved, drop_target)
                                 if not ok:
-                                    # rollback: put it back in its original meld if possible
-                                    # easiest: append to end of same kind meld in edited_table (best effort)
-                                    try:
-                                        edited_table.melds.append(Meld(kind=MeldKind.RUN if drag.source == "table" else MeldKind.RUN, slots=[removed]))
-                                    except Exception:
-                                        pass
+                                    edited_table = snapshot
                                     message = f"Déplacement refusé: {why}"
                                 else:
                                     message = "Déplacement effectué."
