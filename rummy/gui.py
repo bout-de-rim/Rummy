@@ -888,6 +888,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     def current() -> GameState:
         return timeline[time_idx]
 
+    hand_joker_value = 1
     edited_table = current().table.canonicalize()
     manager = DraftMoveManager(current(), edited_table, hand_joker_value)
 
@@ -900,7 +901,6 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     invalid_melds: set[int] = set()
     debug_scroll = 10**9
     debug_log: List[str] = []
-    hand_joker_value = 1
 
     # Drag state
     drag: Optional[DragPayload] = None

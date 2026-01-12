@@ -6,7 +6,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from rummy.gui import DraftMoveManager
-from rummy.meld import Meld
+from rummy.meld import Meld, MeldKind
 from rummy.rules import Ruleset
 from rummy.state import new_game
 from rummy.table import Table
@@ -15,6 +15,14 @@ from rummy.tiles import JOKER_ID, TileSlot
 
 def _table_signature(table: Table):
     return [m.effective_signature() for m in table.canonicalize().melds]
+
+
+def _find_slot(manager: DraftMoveManager, tile_id: int) -> tuple[int, int]:
+    for meld_idx, meld in enumerate(manager.edited_table.melds):
+        for slot_idx, slot in enumerate(meld.slots):
+            if slot.tile_id == tile_id:
+                return meld_idx, slot_idx
+    raise AssertionError(f"Tile {tile_id} not found on table")
 
 
 def _state_with_opening_done() -> Ruleset:
@@ -114,4 +122,55 @@ def test_move_table_slot_rolls_back_on_invalid_drop():
 
     assert not ok
     assert "Déplacement refusé" in reason
+    assert _table_signature(manager.edited_table) == original
+
+
+def test_drag_drop_roundtrip_restores_table():
+    state = _state_with_opening_done()
+    table = Table(
+        [
+            Meld.from_effective_run(color=0, start=1, length=3),
+            Meld.from_effective_group(value=3, colors=[1, 2, 3]),
+        ]
+    )
+    manager = DraftMoveManager(state, table)
+    original = _table_signature(manager.edited_table)
+
+    meld_idx, slot_idx = _find_slot(manager, tile_id=2)
+    ok, reason = manager.move_table_slot(meld_idx, slot_idx, ("group", 0, 2))
+    assert ok, reason
+
+    meld_idx, slot_idx = _find_slot(manager, tile_id=2)
+    ok, reason = manager.move_table_slot(meld_idx, slot_idx, ("run", 0, -1))
+    assert ok, reason
+
+    assert _table_signature(manager.edited_table) == original
+
+
+def test_drag_drop_joker_roundtrip_restores_table():
+    state = _state_with_opening_done()
+    group_a = Meld(
+        kind=MeldKind.GROUP,
+        slots=[
+            TileSlot.from_effective(color=0, value=7, use_joker=True),
+            TileSlot.from_effective(color=1, value=7),
+            TileSlot.from_effective(color=2, value=7),
+        ],
+    )
+    group_b = Meld(
+        kind=MeldKind.GROUP,
+        slots=[TileSlot.from_effective(color=3, value=7)],
+    )
+    table = Table([group_a, group_b])
+    manager = DraftMoveManager(state, table)
+    original = _table_signature(manager.edited_table)
+
+    meld_idx, slot_idx = _find_slot(manager, tile_id=JOKER_ID)
+    ok, reason = manager.move_table_slot(meld_idx, slot_idx, ("group", 1, 6))
+    assert ok, reason
+
+    meld_idx, slot_idx = _find_slot(manager, tile_id=JOKER_ID)
+    ok, reason = manager.move_table_slot(meld_idx, slot_idx, ("group", 0, 6))
+    assert ok, reason
+
     assert _table_signature(manager.edited_table) == original
