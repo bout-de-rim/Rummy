@@ -24,6 +24,8 @@ Hard constraint:
 """
 
 from dataclasses import dataclass
+import os
+import pathlib
 from typing import Dict, List, Optional, Tuple, Any
 import traceback
 
@@ -71,6 +73,13 @@ def compute_delta_from_tables(base_table: Table, edited_table: Table) -> Tuple[O
     return TileMultiset(diff), ""
 
 
+def resolve_screenshot_path() -> pathlib.Path:
+    env_path = os.getenv("RUMMY_GUI_SCREENSHOT_PATH")
+    if env_path:
+        return pathlib.Path(env_path)
+    return pathlib.Path("rummy_gui_screenshot.png")
+
+
 def build_play_move(state: GameState, edited_table: Table) -> Tuple[Optional[Move], str]:
     base_table = state.table.canonicalize()
     draft_points = _draft_points_toward_opening(base_table, edited_table)
@@ -110,6 +119,31 @@ def remaining_hand_after_edit(state: GameState, edited_table: Table) -> TileMult
         return state.hands[state.current_player].sub(delta)
     except ValueError:
         return state.hands[state.current_player].copy()
+
+
+@dataclass
+class TimelineController:
+    timeline: List[GameState]
+    index: int = 0
+
+    @classmethod
+    def from_state(cls, state: GameState) -> "TimelineController":
+        return cls([state], 0)
+
+    @property
+    def current(self) -> GameState:
+        return self.timeline[self.index]
+
+    def at_end(self) -> bool:
+        return self.index == len(self.timeline) - 1
+
+    def append(self, state: GameState) -> None:
+        self.timeline.append(state)
+        self.index = len(self.timeline) - 1
+
+    def jump(self, index: int) -> None:
+        if 0 <= index < len(self.timeline):
+            self.index = index
 
 
 # --- Theme ---------------------------------------------------------------------
@@ -567,6 +601,267 @@ class DragPayload:
 
 # --- GUI entry -----------------------------------------------------------------
 
+
+@dataclass
+class DraftMoveManager:
+    state: GameState
+    edited_table: Table
+    hand_joker_value: int = 1
+
+    def refresh(
+        self,
+        *,
+        state: Optional[GameState] = None,
+        edited_table: Optional[Table] = None,
+        hand_joker_value: Optional[int] = None,
+    ) -> None:
+        if state is not None:
+            self.state = state
+        if edited_table is not None:
+            self.edited_table = edited_table
+        if hand_joker_value is not None:
+            self.hand_joker_value = hand_joker_value
+
+    def remove_slot_from_table(self, meld_idx: int, slot_idx: int) -> TileSlot:
+        m = self.edited_table.melds[meld_idx]
+        s = m.slots.pop(slot_idx)
+        if not m.slots:
+            # keep structure minimal
+            self.edited_table.melds.pop(meld_idx)
+        return s
+
+    def adapt_slot_for_target(self, existing: TileSlot, target: Tuple[str, int, int]) -> TileSlot:
+        """Adjust joker assignment to match drop target when needed; non-jokers unchanged."""
+        kind, a, b = target
+        if existing.tile_id != JOKER_ID:
+            return existing
+
+        if kind == "group":
+            block, value_idx = a, b
+            target_val = value_idx + 1
+            mapping = map_groups_cells_to_meld_indices(self.edited_table)
+            meld_idx = mapping.get((block, value_idx))
+            used = set()
+            if meld_idx is not None:
+                for s in self.edited_table.melds[meld_idx].slots:
+                    c = _tile_color_index(s)
+                    if c is not None:
+                        used.add(c)
+            # For a joker dragged from table, if it already has a color that is unused, keep it; else choose first missing.
+            color = existing.assigned_color
+            if color is None or color in used:
+                color = next((c for c in range(4) if c not in used), 0)
+            return TileSlot(JOKER_ID, assigned_color=color, assigned_value=target_val)
+
+        # run
+        row = a
+        row_color = row // 2
+        v = existing.assigned_value if existing.assigned_value is not None else self.hand_joker_value
+        return TileSlot(JOKER_ID, assigned_color=row_color, assigned_value=v)
+
+    def assign_joker_for_run(
+        self,
+        slot: TileSlot,
+        row_color: int,
+        touching_ranges: List[Tuple[int, int]],
+    ) -> TileSlot:
+        if slot.tile_id != JOKER_ID:
+            return slot
+        candidates: List[int] = []
+        for vmin, vmax in touching_ranges:
+            candidates.extend([vmin - 1, vmax + 1])
+        candidates = [v for v in candidates if 1 <= v <= 13]
+        chosen: Optional[int] = None
+        if slot.assigned_value in candidates:
+            chosen = slot.assigned_value
+        elif candidates:
+            chosen = candidates[0]
+        else:
+            chosen = slot.assigned_value or self.hand_joker_value
+        return TileSlot(JOKER_ID, assigned_color=row_color, assigned_value=chosen)
+
+    def new_only_melds_for_player(self) -> Optional[set[int]]:
+        if self.state.initial_meld_done[self.state.current_player]:
+            return None
+        base_table = self.state.table.canonicalize()
+        return _new_only_meld_indices(base_table, self.edited_table)
+
+    def run_candidate_ranges(self, row: int, row_color: int, new_only_melds: Optional[set[int]]) -> List[Tuple[int, int, int]]:
+        row_map = map_runs_rows_to_meld_indices(self.edited_table)
+        other_row = row_color * 2 + (1 if row == row_color * 2 else 0)
+        meld_candidates: List[int] = []
+        for candidate_idx in row_map.get(row, []):
+            if candidate_idx not in meld_candidates:
+                meld_candidates.append(candidate_idx)
+        for candidate_idx in row_map.get(other_row, []):
+            if candidate_idx not in meld_candidates:
+                meld_candidates.append(candidate_idx)
+
+        candidate_ranges: List[Tuple[int, int, int]] = []
+        for candidate_idx in meld_candidates:
+            if new_only_melds is not None and candidate_idx not in new_only_melds:
+                continue
+            vmin, vmax = _run_value_range(self.edited_table.melds[candidate_idx])
+            candidate_ranges.append((candidate_idx, vmin, vmax))
+        return candidate_ranges
+
+    @staticmethod
+    def touching_run_indices(slot_value: int, candidate_ranges: List[Tuple[int, int, int]]) -> List[int]:
+        touching: List[int] = []
+        for candidate_idx, vmin, vmax in candidate_ranges:
+            if slot_value in (vmin - 1, vmax + 1):
+                touching.append(candidate_idx)
+        return touching
+
+    def merge_touching_runs(
+        self,
+        touching: List[int],
+        slot: TileSlot,
+        row_color: int,
+        slot_value: int,
+    ) -> Tuple[bool, str]:
+        if len(touching) < 2:
+            return False, "not mergeable"
+        touching_sorted = sorted(touching, key=lambda idx: _run_value_range(self.edited_table.melds[idx])[0])
+        for i in range(len(touching_sorted) - 1):
+            first_idx = touching_sorted[i]
+            second_idx = touching_sorted[i + 1]
+            first_range = _run_value_range(self.edited_table.melds[first_idx])
+            second_range = _run_value_range(self.edited_table.melds[second_idx])
+            if slot_value == first_range[1] + 1 and slot_value == second_range[0] - 1:
+                combined_slots = (
+                    self.edited_table.melds[first_idx].slots
+                    + self.edited_table.melds[second_idx].slots
+                )
+                ok, why = can_insert_into_run(combined_slots, slot, row_color)
+                if not ok:
+                    return False, why
+                for idx in sorted([first_idx, second_idx], reverse=True):
+                    self.edited_table.melds.pop(idx)
+                self.edited_table.melds.append(
+                    Meld(kind=MeldKind.RUN, slots=combined_slots + [slot])
+                )
+                return True, ""
+        return False, "run not consecutive"
+
+    def insert_into_existing_run(self, touching: List[int], slot: TileSlot, row_color: int, slot_value: int) -> Tuple[bool, str]:
+        for candidate_idx in touching:
+            vmin, vmax = _run_value_range(self.edited_table.melds[candidate_idx])
+            if slot_value not in (vmin - 1, vmax + 1):
+                continue
+            ok, _ = can_insert_into_run(self.edited_table.melds[candidate_idx].slots, slot, row_color)
+            if ok:
+                self.edited_table.melds[candidate_idx].slots.append(slot)
+                return True, ""
+        return False, "run not consecutive"
+
+    def find_group_meld(self, block: int, value_idx: int, new_only_melds: Optional[set[int]]) -> Tuple[Optional[int], str]:
+        mapping = map_groups_cells_to_meld_indices(self.edited_table)
+        meld_idx = mapping.get((block, value_idx))
+        if meld_idx is None:
+            return None, ""
+        if new_only_melds is not None and meld_idx not in new_only_melds:
+            return None, "meld non autorisé avant ouverture"
+        return meld_idx, ""
+
+    def insert_slot_into_target(self, slot: TileSlot, target: Tuple[str, int, int]) -> Tuple[bool, str]:
+        """Try to insert slot into target meld; create meld if needed."""
+        kind, a, b = target
+
+        if kind == "run":
+            row = a
+            row_color = row // 2
+            new_only_melds = self.new_only_melds_for_player()
+            candidate_ranges = self.run_candidate_ranges(row, row_color, new_only_melds)
+            touching_ranges = [(vmin, vmax) for _, vmin, vmax in candidate_ranges]
+            slot = self.assign_joker_for_run(slot, row_color, touching_ranges)
+            slot_value = _tile_value(slot)
+            if slot_value is None:
+                return False, "joker has no value"
+
+            touching = self.touching_run_indices(slot_value, candidate_ranges)
+
+            if not touching:
+                ok, why = can_insert_into_run([], slot, row_color)
+                if not ok:
+                    return False, why
+                self.edited_table.melds.append(Meld(kind=MeldKind.RUN, slots=[slot]))
+                return True, ""
+
+            merged, merge_reason = self.merge_touching_runs(touching, slot, row_color, slot_value)
+            if merged:
+                return True, ""
+            inserted, insert_reason = self.insert_into_existing_run(touching, slot, row_color, slot_value)
+            if inserted:
+                return True, ""
+            return False, merge_reason if merge_reason != "not mergeable" else insert_reason
+
+        # group
+        block, value_idx = a, b
+        new_only_melds = self.new_only_melds_for_player()
+        meld_idx, reason = self.find_group_meld(block, value_idx, new_only_melds)
+        if reason:
+            return False, reason
+        if meld_idx is None:
+            ok, why = can_insert_into_group([], slot, value_idx)
+            if not ok:
+                return False, why
+            self.edited_table.melds.append(Meld(kind=MeldKind.GROUP, slots=[slot]))
+            return True, ""
+        ok, why = can_insert_into_group(self.edited_table.melds[meld_idx].slots, slot, value_idx)
+        if not ok:
+            return False, why
+        self.edited_table.melds[meld_idx].slots.append(slot)
+        return True, ""
+
+    def slot_can_return_to_hand(self, meld_idx: int, slot_idx: int) -> bool:
+        """Only allow returning to hand tiles that were added from hand in this draft (delta positive)."""
+        base_counts = self.state.table.canonicalize().multiset().counts
+        # Determine if this specific slot is beyond base occurrences.
+        seen = [0] * len(base_counts)
+        # Reproduce the same traversal order as rendering for determinism.
+        for mi, meld in enumerate(self.edited_table.melds):
+            for si, s in enumerate(meld.slots):
+                tid = s.tile_id
+                if 0 <= tid < len(base_counts):
+                    seen[tid] += 1
+                    is_new = seen[tid] > base_counts[tid]
+                else:
+                    is_new = False
+                if mi == meld_idx and si == slot_idx:
+                    return is_new
+        return False
+
+    @staticmethod
+    def clone_table(table: Table) -> Table:
+        return Table([Meld(kind=m.kind, slots=list(m.slots)) for m in table.melds])
+
+    def can_move_table_tile(self, meld_idx: int, slot_idx: int) -> bool:
+        if self.state.initial_meld_done[self.state.current_player]:
+            return True
+        return self.slot_can_return_to_hand(meld_idx, slot_idx)
+
+    def move_table_slot(self, meld_idx: int, slot_idx: int, drop_target: Tuple[str, int, int]) -> Tuple[bool, str]:
+        if not self.can_move_table_tile(meld_idx, slot_idx):
+            return False, "Déplacement refusé (avant ouverture)."
+        snapshot = self.clone_table(self.edited_table)
+        try:
+            slot = self.edited_table.melds[meld_idx].slots[slot_idx]
+        except Exception:
+            slot = None
+        try:
+            removed = self.remove_slot_from_table(meld_idx, slot_idx)
+        except Exception:
+            removed = slot
+        if removed is None:
+            return False, "Déplacement refusé: tuile introuvable."
+        moved = self.adapt_slot_for_target(removed, drop_target)
+        ok, why = self.insert_slot_into_target(moved, drop_target)
+        if not ok:
+            self.edited_table = snapshot
+            return False, f"Déplacement refusé: {why}"
+        return True, "Déplacement effectué."
+
 def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) -> None:  # pragma: no cover
     if pygame is None:
         raise ImportError("pygame is required for the GUI. Install it with `pip install pygame`.")
@@ -594,6 +889,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         return timeline[time_idx]
 
     edited_table = current().table.canonicalize()
+    manager = DraftMoveManager(current(), edited_table, hand_joker_value)
 
     # UI state
     selected_target: Optional[Tuple[str, int, int]] = None  # ('run', row, -1) or ('group', block, value_idx)
@@ -617,8 +913,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     tile_hits: List[TileHit] = []
 
     def reset_draft():
-        nonlocal edited_table, selected_target, drag, pending_draw_confirm, invalid_melds
+        nonlocal edited_table, selected_target, drag, pending_draw_confirm, invalid_melds, manager
         edited_table = current().table.canonicalize()
+        manager.refresh(state=current(), edited_table=edited_table)
         selected_target = None
         drag = None
         pending_draw_confirm = False
@@ -643,7 +940,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         return canonical_table == base_table
 
     def _perform_draw_action():
-        nonlocal edited_table, message, pending_draw_confirm, time_idx, invalid_melds
+        nonlocal edited_table, message, pending_draw_confirm, time_idx, invalid_melds, manager
         before = current()
         if before.deck_index >= len(before.deck_order):
             move = Move.skip()
@@ -662,6 +959,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         timeline.append(nxt)
         time_idx = len(timeline) - 1
         edited_table = current().table.canonicalize()
+        manager.refresh(state=current(), edited_table=edited_table)
         pending_draw_confirm = False
         invalid_melds = set()
         message = "Pioche effectuée."
@@ -689,201 +987,8 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                     pygame.quit()
                     return
 
-    def _remove_slot_from_table(meld_idx: int, slot_idx: int) -> TileSlot:
-        nonlocal edited_table
-        m = edited_table.melds[meld_idx]
-        s = m.slots.pop(slot_idx)
-        if not m.slots:
-            # keep structure minimal
-            edited_table.melds.pop(meld_idx)
-        return s
-
-    def _adapt_slot_for_target(existing: TileSlot, target: Tuple[str, int, int]) -> TileSlot:
-        """Adjust joker assignment to match drop target when needed; non-jokers unchanged."""
-        nonlocal hand_joker_value, edited_table
-        kind, a, b = target
-        if existing.tile_id != JOKER_ID:
-            return existing
-
-        if kind == "group":
-            block, value_idx = a, b
-            target_val = value_idx + 1
-            mapping = map_groups_cells_to_meld_indices(edited_table)
-            meld_idx = mapping.get((block, value_idx))
-            used = set()
-            if meld_idx is not None:
-                for s in edited_table.melds[meld_idx].slots:
-                    c = _tile_color_index(s)
-                    if c is not None:
-                        used.add(c)
-            # For a joker dragged from table, if it already has a color that is unused, keep it; else choose first missing.
-            color = existing.assigned_color
-            if color is None or color in used:
-                color = next((c for c in range(4) if c not in used), 0)
-            return TileSlot(JOKER_ID, assigned_color=color, assigned_value=target_val)
-
-        # run
-        row = a
-        row_color = row // 2
-        v = existing.assigned_value if existing.assigned_value is not None else hand_joker_value
-        return TileSlot(JOKER_ID, assigned_color=row_color, assigned_value=v)
-
-    def _assign_joker_for_run(
-        slot: TileSlot,
-        row_color: int,
-        touching_ranges: List[Tuple[int, int]],
-    ) -> TileSlot:
-        nonlocal hand_joker_value
-        if slot.tile_id != JOKER_ID:
-            return slot
-        candidates: List[int] = []
-        for vmin, vmax in touching_ranges:
-            candidates.extend([vmin - 1, vmax + 1])
-        candidates = [v for v in candidates if 1 <= v <= 13]
-        chosen: Optional[int] = None
-        if slot.assigned_value in candidates:
-            chosen = slot.assigned_value
-        elif candidates:
-            chosen = candidates[0]
-        else:
-            chosen = slot.assigned_value or hand_joker_value
-        return TileSlot(JOKER_ID, assigned_color=row_color, assigned_value=chosen)
-
-    def _new_only_melds_for_player() -> Optional[set[int]]:
-        if current().initial_meld_done[current().current_player]:
-            return None
-        base_table = current().table.canonicalize()
-        return _new_only_meld_indices(base_table, edited_table)
-
-    def _run_candidate_ranges(row: int, row_color: int, new_only_melds: Optional[set[int]]) -> List[Tuple[int, int, int]]:
-        row_map = map_runs_rows_to_meld_indices(edited_table)
-        other_row = row_color * 2 + (1 if row == row_color * 2 else 0)
-        meld_candidates: List[int] = []
-        for candidate_idx in row_map.get(row, []):
-            if candidate_idx not in meld_candidates:
-                meld_candidates.append(candidate_idx)
-        for candidate_idx in row_map.get(other_row, []):
-            if candidate_idx not in meld_candidates:
-                meld_candidates.append(candidate_idx)
-
-        candidate_ranges: List[Tuple[int, int, int]] = []
-        for candidate_idx in meld_candidates:
-            if new_only_melds is not None and candidate_idx not in new_only_melds:
-                continue
-            vmin, vmax = _run_value_range(edited_table.melds[candidate_idx])
-            candidate_ranges.append((candidate_idx, vmin, vmax))
-        return candidate_ranges
-
-    def _touching_run_indices(slot_value: int, candidate_ranges: List[Tuple[int, int, int]]) -> List[int]:
-        touching: List[int] = []
-        for candidate_idx, vmin, vmax in candidate_ranges:
-            if slot_value in (vmin - 1, vmax + 1):
-                touching.append(candidate_idx)
-        return touching
-
-    def _merge_touching_runs(
-        touching: List[int],
-        slot: TileSlot,
-        row_color: int,
-        slot_value: int,
-    ) -> Tuple[bool, str]:
-        if len(touching) < 2:
-            return False, "not mergeable"
-        touching_sorted = sorted(touching, key=lambda idx: _run_value_range(edited_table.melds[idx])[0])
-        for i in range(len(touching_sorted) - 1):
-            first_idx = touching_sorted[i]
-            second_idx = touching_sorted[i + 1]
-            first_range = _run_value_range(edited_table.melds[first_idx])
-            second_range = _run_value_range(edited_table.melds[second_idx])
-            if slot_value == first_range[1] + 1 and slot_value == second_range[0] - 1:
-                combined_slots = (
-                    edited_table.melds[first_idx].slots
-                    + edited_table.melds[second_idx].slots
-                )
-                ok, why = can_insert_into_run(combined_slots, slot, row_color)
-                if not ok:
-                    return False, why
-                for idx in sorted([first_idx, second_idx], reverse=True):
-                    edited_table.melds.pop(idx)
-                edited_table.melds.append(
-                    Meld(kind=MeldKind.RUN, slots=combined_slots + [slot])
-                )
-                return True, ""
-        return False, "run not consecutive"
-
-    def _insert_into_existing_run(touching: List[int], slot: TileSlot, row_color: int, slot_value: int) -> Tuple[bool, str]:
-        for candidate_idx in touching:
-            vmin, vmax = _run_value_range(edited_table.melds[candidate_idx])
-            if slot_value not in (vmin - 1, vmax + 1):
-                continue
-            ok, _ = can_insert_into_run(edited_table.melds[candidate_idx].slots, slot, row_color)
-            if ok:
-                edited_table.melds[candidate_idx].slots.append(slot)
-                return True, ""
-        return False, "run not consecutive"
-
-    def _find_group_meld(block: int, value_idx: int, new_only_melds: Optional[set[int]]) -> Tuple[Optional[int], str]:
-        mapping = map_groups_cells_to_meld_indices(edited_table)
-        meld_idx = mapping.get((block, value_idx))
-        if meld_idx is None:
-            return None, ""
-        if new_only_melds is not None and meld_idx not in new_only_melds:
-            return None, "meld non autorisé avant ouverture"
-        return meld_idx, ""
-
-    def _insert_slot_into_target(slot: TileSlot, target: Tuple[str, int, int]) -> Tuple[bool, str]:
-        """Try to insert slot into target meld; create meld if needed."""
-        nonlocal edited_table
-        kind, a, b = target
-
-        if kind == "run":
-            row = a
-            row_color = row // 2
-            new_only_melds = _new_only_melds_for_player()
-            candidate_ranges = _run_candidate_ranges(row, row_color, new_only_melds)
-            touching_ranges = [(vmin, vmax) for _, vmin, vmax in candidate_ranges]
-            slot = _assign_joker_for_run(slot, row_color, touching_ranges)
-            slot_value = _tile_value(slot)
-            if slot_value is None:
-                return False, "joker has no value"
-
-            touching = _touching_run_indices(slot_value, candidate_ranges)
-
-            if not touching:
-                ok, why = can_insert_into_run([], slot, row_color)
-                if not ok:
-                    return False, why
-                edited_table.melds.append(Meld(kind=MeldKind.RUN, slots=[slot]))
-                return True, ""
-
-            merged, merge_reason = _merge_touching_runs(touching, slot, row_color, slot_value)
-            if merged:
-                return True, ""
-            inserted, insert_reason = _insert_into_existing_run(touching, slot, row_color, slot_value)
-            if inserted:
-                return True, ""
-            return False, merge_reason if merge_reason != "not mergeable" else insert_reason
-
-        # group
-        block, value_idx = a, b
-        new_only_melds = _new_only_melds_for_player()
-        meld_idx, reason = _find_group_meld(block, value_idx, new_only_melds)
-        if reason:
-            return False, reason
-        if meld_idx is None:
-            ok, why = can_insert_into_group([], slot, value_idx)
-            if not ok:
-                return False, why
-            edited_table.melds.append(Meld(kind=MeldKind.GROUP, slots=[slot]))
-            return True, ""
-        ok, why = can_insert_into_group(edited_table.melds[meld_idx].slots, slot, value_idx)
-        if not ok:
-            return False, why
-        edited_table.melds[meld_idx].slots.append(slot)
-        return True, ""
-
     def try_place_from_hand(tile_id: int):
-        nonlocal message, pending_draw_confirm, invalid_melds
+        nonlocal message, pending_draw_confirm, invalid_melds, edited_table
         if selected_target is None:
             message = "Aucun meld sélectionné."
             return
@@ -892,41 +997,16 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         else:
             # joker -> use target adaptation
             slot = TileSlot(JOKER_ID, assigned_color=None, assigned_value=hand_joker_value)
-            slot = _adapt_slot_for_target(slot, selected_target)
+            slot = manager.adapt_slot_for_target(slot, selected_target)
 
-        ok, why = _insert_slot_into_target(slot, selected_target)
+        ok, why = manager.insert_slot_into_target(slot, selected_target)
         if ok:
+            edited_table = manager.edited_table
             message = "Tuile placée."
             pending_draw_confirm = False
             invalid_melds = set()
         else:
             message = f"Placement refusé: {why}"
-
-    def _slot_can_return_to_hand(meld_idx: int, slot_idx: int) -> bool:
-        """Only allow returning to hand tiles that were added from hand in this draft (delta positive)."""
-        base_counts = current().table.canonicalize().multiset().counts
-        # Determine if this specific slot is beyond base occurrences.
-        seen = [0] * len(base_counts)
-        # Reproduce the same traversal order as rendering for determinism.
-        for mi, meld in enumerate(edited_table.melds):
-            for si, s in enumerate(meld.slots):
-                tid = s.tile_id
-                if 0 <= tid < len(base_counts):
-                    seen[tid] += 1
-                    is_new = seen[tid] > base_counts[tid]
-                else:
-                    is_new = False
-                if mi == meld_idx and si == slot_idx:
-                    return is_new
-        return False
-
-    def _clone_table(table: Table) -> Table:
-        return Table([Meld(kind=m.kind, slots=list(m.slots)) for m in table.melds])
-
-    def _can_move_table_tile(meld_idx: int, slot_idx: int) -> bool:
-        if current().initial_meld_done[current().current_player]:
-            return True
-        return _slot_can_return_to_hand(meld_idx, slot_idx)
 
     def _drop_target_from_pos(pos: Tuple[int, int]) -> Tuple[Optional[Tuple[str, int, int]], bool]:
         drop_target: Optional[Tuple[str, int, int]] = None
@@ -946,7 +1026,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         nonlocal drag, message, drag_offset
         for th in tile_hits:
             if th.rect.collidepoint(pos):
-                if not _can_move_table_tile(th.meld_idx, th.slot_idx):
+                if not manager.can_move_table_tile(th.meld_idx, th.slot_idx):
                     message = "Déplacement refusé (avant ouverture)."
                     return True
                 s = edited_table.melds[th.meld_idx].slots[th.slot_idx]
@@ -976,12 +1056,13 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         return False
 
     def _apply_drop(drop_target: Optional[Tuple[str, int, int]], dropped_to_hand: bool) -> None:
-        nonlocal drag, message, pending_draw_confirm, edited_table
+        nonlocal drag, message, pending_draw_confirm, edited_table, manager
         if drag is None:
             return
         if dropped_to_hand and drag.source == "table":
-            if drag.meld_idx is not None and drag.slot_idx is not None and _slot_can_return_to_hand(drag.meld_idx, drag.slot_idx):
-                _remove_slot_from_table(drag.meld_idx, drag.slot_idx)
+            if drag.meld_idx is not None and drag.slot_idx is not None and manager.slot_can_return_to_hand(drag.meld_idx, drag.slot_idx):
+                manager.remove_slot_from_table(drag.meld_idx, drag.slot_idx)
+                edited_table = manager.edited_table
                 message = "Tuile rendue à la main."
             else:
                 message = "Retour à la main refusé (tuile du plateau initial)."
@@ -995,35 +1076,18 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         if drag.source == "hand":
             slot = drag.slot
             if slot.tile_id == JOKER_ID:
-                slot = _adapt_slot_for_target(slot, drop_target)
-            ok, why = _insert_slot_into_target(slot, drop_target)
+                slot = manager.adapt_slot_for_target(slot, drop_target)
+            ok, why = manager.insert_slot_into_target(slot, drop_target)
+            edited_table = manager.edited_table
             message = "Tuile placée." if ok else f"Placement refusé: {why}"
             if ok:
                 pending_draw_confirm = False
             return
 
         assert drag.meld_idx is not None and drag.slot_idx is not None
-        if not _can_move_table_tile(drag.meld_idx, drag.slot_idx):
-            message = "Déplacement refusé (avant ouverture)."
-            return
-        snapshot = _clone_table(edited_table)
-        orig_meld = drag.meld_idx
-        orig_slot = drag.slot_idx
-        try:
-            slot = edited_table.melds[orig_meld].slots[orig_slot]
-        except Exception:
-            slot = drag.slot
-        try:
-            removed = _remove_slot_from_table(orig_meld, orig_slot)
-        except Exception:
-            removed = slot
-        moved = _adapt_slot_for_target(removed, drop_target)
-        ok, why = _insert_slot_into_target(moved, drop_target)
-        if not ok:
-            edited_table = snapshot
-            message = f"Déplacement refusé: {why}"
-        else:
-            message = "Déplacement effectué."
+        ok, move_message = manager.move_table_slot(drag.meld_idx, drag.slot_idx, drop_target)
+        edited_table = manager.edited_table
+        message = move_message
 
     def cycle_table_joker_value(meld_idx: int, slot_idx: int):
         nonlocal edited_table, message
@@ -1486,6 +1550,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             timeline.append(nxt)
                             time_idx = len(timeline) - 1
                             edited_table = current().table.canonicalize()
+                            manager.refresh(state=current(), edited_table=edited_table)
                             pending_draw_confirm = False
                             invalid_melds = set()
                             message = "PLAY effectué."
@@ -1585,6 +1650,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                         for hc in hand_cells:
                             if hc.rect.collidepoint(event.pos) and hc.tile_id == JOKER_ID and hc.count > 0:
                                 hand_joker_value = (hand_joker_value % 13) + 1
+                                manager.refresh(hand_joker_value=hand_joker_value)
                                 message = f"Joker main => valeur {hand_joker_value}"
                                 break
                         else:
