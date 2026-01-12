@@ -595,6 +595,8 @@ class DragPayload:
     # for table source
     meld_idx: Optional[int] = None
     slot_idx: Optional[int] = None
+    # for recovered joker source
+    recovered_idx: Optional[int] = None
     # for hand source
     hand_cell: Optional[Tuple[int, int]] = None
 
@@ -814,6 +816,63 @@ class DraftMoveManager:
         self.edited_table.melds[meld_idx].slots.append(slot)
         return True, ""
 
+    def try_replace_joker_in_target(
+        self,
+        slot: TileSlot,
+        target: Tuple[str, int, int],
+    ) -> Tuple[bool, Optional[TileSlot], str]:
+        if slot.tile_id == JOKER_ID:
+            return False, None, ""
+
+        kind, a, b = target
+        slot_value = _tile_value(slot)
+        slot_color = _tile_color_index(slot)
+        if slot_value is None or slot_color is None:
+            return False, None, ""
+
+        new_only_melds = self.new_only_melds_for_player()
+
+        if kind == "run":
+            row = a
+            row_color = row // 2
+            if slot_color != row_color:
+                return False, None, ""
+            candidate_ranges = self.run_candidate_ranges(row, row_color, new_only_melds)
+            for candidate_idx, _, _ in candidate_ranges:
+                meld = self.edited_table.melds[candidate_idx]
+                for idx, existing in enumerate(meld.slots):
+                    if existing.tile_id != JOKER_ID:
+                        continue
+                    if _tile_value(existing) != slot_value:
+                        continue
+                    if _tile_color_index(existing) != row_color:
+                        continue
+                    meld.slots[idx] = slot
+                    return True, existing, ""
+            return False, None, ""
+
+        if kind == "group":
+            block, value_idx = a, b
+            meld_idx, reason = self.find_group_meld(block, value_idx, new_only_melds)
+            if reason:
+                return False, None, reason
+            if meld_idx is None:
+                return False, None, ""
+            target_val = value_idx + 1
+            meld = self.edited_table.melds[meld_idx]
+            for idx, existing in enumerate(meld.slots):
+                if existing.tile_id != JOKER_ID:
+                    continue
+                if _tile_value(existing) != target_val:
+                    continue
+                if _tile_color_index(existing) != slot_color:
+                    continue
+                meld.slots[idx] = slot
+                return True, existing, ""
+            return False, None, ""
+
+        return False, None, ""
+
     def slot_can_return_to_hand(self, meld_idx: int, slot_idx: int) -> bool:
         """Only allow returning to hand tiles that were added from hand in this draft (delta positive)."""
         base_counts = self.state.table.canonicalize().multiset().counts
@@ -891,6 +950,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     hand_joker_value = 1
     edited_table = current().table.canonicalize()
     manager = DraftMoveManager(current(), edited_table, hand_joker_value)
+    recovered_jokers: List[TileSlot] = []
 
     # UI state
     selected_target: Optional[Tuple[str, int, int]] = None  # ('run', row, -1) or ('group', block, value_idx)
@@ -911,15 +971,17 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
     runs_row_hits: List[RunsRowHit] = []
     groups_col_hits: List[GroupsColHit] = []
     tile_hits: List[TileHit] = []
+    recovered_hits: List[Tuple[pygame.Rect, int]] = []
 
     def reset_draft():
-        nonlocal edited_table, selected_target, drag, pending_draw_confirm, invalid_melds, manager
+        nonlocal edited_table, selected_target, drag, pending_draw_confirm, invalid_melds, manager, recovered_jokers
         edited_table = current().table.canonicalize()
         manager.refresh(state=current(), edited_table=edited_table)
         selected_target = None
         drag = None
         pending_draw_confirm = False
         invalid_melds = set()
+        recovered_jokers = []
 
     def _draft_delta_from_hand(state: GameState, table: Table) -> Optional[TileMultiset]:
         non_empty = Table([meld for meld in table.melds if meld.slots])
@@ -940,7 +1002,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         return canonical_table == base_table
 
     def _perform_draw_action():
-        nonlocal edited_table, message, pending_draw_confirm, time_idx, invalid_melds, manager
+        nonlocal edited_table, message, pending_draw_confirm, time_idx, invalid_melds, manager, recovered_jokers
+        if recovered_jokers:
+            message = "Replacez tous les jokers récupérés avant de piocher."
+            return
         before = current()
         if before.deck_index >= len(before.deck_order):
             move = Move.skip()
@@ -962,6 +1027,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
         manager.refresh(state=current(), edited_table=edited_table)
         pending_draw_confirm = False
         invalid_melds = set()
+        recovered_jokers = []
         message = "Pioche effectuée."
 
     def crash_screen(tb: str):
@@ -988,7 +1054,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                     return
 
     def try_place_from_hand(tile_id: int):
-        nonlocal message, pending_draw_confirm, invalid_melds, edited_table
+        nonlocal message, pending_draw_confirm, invalid_melds, edited_table, recovered_jokers
         if selected_target is None:
             message = "Aucun meld sélectionné."
             return
@@ -998,6 +1064,19 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             # joker -> use target adaptation
             slot = TileSlot(JOKER_ID, assigned_color=None, assigned_value=hand_joker_value)
             slot = manager.adapt_slot_for_target(slot, selected_target)
+
+        if slot.tile_id != JOKER_ID:
+            replaced, recovered, reason = manager.try_replace_joker_in_target(slot, selected_target)
+            if reason:
+                message = f"Placement refusé: {reason}"
+                return
+            if replaced and recovered is not None:
+                recovered_jokers.append(recovered)
+                edited_table = manager.edited_table
+                message = "Joker récupéré."
+                pending_draw_confirm = False
+                invalid_melds = set()
+                return
 
         ok, why = manager.insert_slot_into_target(slot, selected_target)
         if ok:
@@ -1055,8 +1134,18 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 return True
         return False
 
+    def _start_drag_from_recovered(pos: Tuple[int, int]) -> bool:
+        nonlocal drag, drag_offset
+        for rect, idx in recovered_hits:
+            if rect.collidepoint(pos):
+                slot = recovered_jokers[idx]
+                drag = DragPayload(source="recovered", tile_id=slot.tile_id, slot=slot, recovered_idx=idx)
+                drag_offset = (-int(tile_w * 0.4), -int(tile_h * 0.45))
+                return True
+        return False
+
     def _apply_drop(drop_target: Optional[Tuple[str, int, int]], dropped_to_hand: bool) -> None:
-        nonlocal drag, message, pending_draw_confirm, edited_table, manager
+        nonlocal drag, message, pending_draw_confirm, edited_table, manager, recovered_jokers
         if drag is None:
             return
         if dropped_to_hand and drag.source == "table":
@@ -1073,15 +1162,29 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 try_place_from_hand(drag.tile_id)
             return
 
-        if drag.source == "hand":
+        if drag.source in ("hand", "recovered"):
             slot = drag.slot
             if slot.tile_id == JOKER_ID:
                 slot = manager.adapt_slot_for_target(slot, drop_target)
+            if drag.source == "hand":
+                replaced, recovered, reason = manager.try_replace_joker_in_target(slot, drop_target)
+                if reason:
+                    message = f"Placement refusé: {reason}"
+                    return
+                if replaced and recovered is not None:
+                    recovered_jokers.append(recovered)
+                    edited_table = manager.edited_table
+                    message = "Joker récupéré."
+                    pending_draw_confirm = False
+                    return
+
             ok, why = manager.insert_slot_into_target(slot, drop_target)
             edited_table = manager.edited_table
             message = "Tuile placée." if ok else f"Placement refusé: {why}"
             if ok:
                 pending_draw_confirm = False
+                if drag.source == "recovered" and drag.recovered_idx is not None:
+                    recovered_jokers.pop(drag.recovered_idx)
             return
 
         assert drag.meld_idx is not None and drag.slot_idx is not None
@@ -1289,9 +1392,20 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
             draw_panel(screen, hand_panel)
             screen.blit(font.render("Hand", True, SUB), (hand_panel.x + 10, hand_panel.y + 6))
 
+            recovered_hits = []
+            recovered_panel_w = 150
+            recovered_panel = pygame.Rect(
+                hand_panel.right - recovered_panel_w - 12,
+                hand_panel.y + 26,
+                recovered_panel_w,
+                hand_panel.height - 36,
+            )
+            draw_panel(screen, recovered_panel)
+            screen.blit(small_font.render("Jokers récupérés", True, SUB), (recovered_panel.x + 8, recovered_panel.y + 6))
+
             hx = hand_panel.x + 12
             hy = hand_panel.y + 26
-            hw = hand_panel.width - 24
+            hw = recovered_panel.x - 12 - hx
             hh = hand_panel.height - 36
             hrows, hcols = 4, 14
             cw = hw / hcols
@@ -1314,7 +1428,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                 screen.blit(axis_font.render(str(c + 1), True, SUB), (int(hx + c * cw + 3), hand_panel.y + 6))
             screen.blit(axis_font.render("J", True, SUB), (int(hx + 13 * cw + 3), hand_panel.y + 6))
             j_val_lbl = small_font.render(f"J={hand_joker_value}", True, SUB)
-            screen.blit(j_val_lbl, (hand_panel.right - 10 - j_val_lbl.get_width(), hand_panel.y + 6))
+            screen.blit(j_val_lbl, (recovered_panel.right - 10 - j_val_lbl.get_width(), hand_panel.y + 6))
 
             remaining = remaining_hand_after_edit(current(), edited_table)
             grid = _hand_grid_counts(remaining)
@@ -1351,6 +1465,22 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             pass
                         else:
                             draw_tile(screen, main, slot, small_font, highlight_border=border, count_badge=count)
+
+            # Recovered joker tiles
+            recovered_tile_w = max(22, int(recovered_panel.width * 0.70))
+            recovered_tile_h = max(30, int(recovered_tile_w * 1.25))
+            rx = recovered_panel.x + (recovered_panel.width - recovered_tile_w) // 2
+            ry = recovered_panel.y + 28
+            if not recovered_jokers:
+                label = small_font.render("Aucun", True, SUB)
+                screen.blit(label, (recovered_panel.x + 8, recovered_panel.y + 32))
+            else:
+                for idx, slot in enumerate(recovered_jokers):
+                    rect = pygame.Rect(rx, ry, recovered_tile_w, recovered_tile_h)
+                    if not (drag and drag.source == "recovered" and drag.recovered_idx == idx):
+                        draw_tile(screen, rect, slot, small_font, highlight_border=ACCENT)
+                    recovered_hits.append((rect, idx))
+                    ry += recovered_tile_h + 8
 
             # Opening indicator (status left)
             p = current().current_player
@@ -1532,6 +1662,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                     if event.key == pygame.K_ESCAPE:
                         running = False
                     elif event.key == pygame.K_RETURN:
+                        if recovered_jokers:
+                            message = "Replacez tous les jokers récupérés avant de jouer."
+                            continue
                         if pending_draw_confirm:
                             _perform_draw_action()
                             continue
@@ -1553,6 +1686,7 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                             manager.refresh(state=current(), edited_table=edited_table)
                             pending_draw_confirm = False
                             invalid_melds = set()
+                            recovered_jokers = []
                             message = "PLAY effectué."
                         else:
                             message = f"PLAY invalide: {err}"
@@ -1563,6 +1697,9 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
                                 if not ok:
                                     invalid_melds.add(idx)
                     elif event.key == pygame.K_d:
+                        if recovered_jokers:
+                            message = "Replacez tous les jokers récupérés avant de piocher."
+                            continue
                         _perform_draw_action()
                     elif event.key == pygame.K_r:
                         reset_draft()
@@ -1627,6 +1764,10 @@ def launch_gui(seed: Optional[int] = None, ruleset: Optional[Ruleset] = None) ->
 
                         # Start drag from hand cell (pick representative tile id)
                         if _start_drag_from_hand(event.pos):
+                            continue
+
+                        # Start drag from recovered jokers
+                        if _start_drag_from_recovered(event.pos):
                             continue
 
                         # Click-select target (fallback interaction)

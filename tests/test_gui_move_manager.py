@@ -174,3 +174,61 @@ def test_drag_drop_joker_roundtrip_restores_table():
     assert ok, reason
 
     assert _table_signature(manager.edited_table) == original
+
+
+def test_replace_joker_in_run_recovers():
+    state = _state_with_opening_done()
+    run_slots = [
+        TileSlot.from_effective(color=0, value=1),
+        TileSlot.from_effective(color=0, value=2),
+        TileSlot.from_effective(color=0, value=3, use_joker=True),
+    ]
+    table = Table([Meld(kind=MeldKind.RUN, slots=run_slots)])
+    manager = DraftMoveManager(state, table)
+
+    slot = TileSlot.from_effective(color=0, value=3)
+    replaced, recovered, reason = manager.try_replace_joker_in_target(slot, ("run", 0, -1))
+
+    assert reason == ""
+    assert replaced
+    assert recovered is not None
+    assert recovered.tile_id == JOKER_ID
+    meld = manager.edited_table.melds[0]
+    assert all(s.tile_id != JOKER_ID for s in meld.slots)
+
+
+def test_replace_joker_in_group_recovers():
+    state = _state_with_opening_done()
+    group = Meld(
+        kind=MeldKind.GROUP,
+        slots=[
+            TileSlot.from_effective(color=0, value=9, use_joker=True),
+            TileSlot.from_effective(color=1, value=9),
+            TileSlot.from_effective(color=2, value=9),
+        ],
+    )
+    table = Table([group])
+    manager = DraftMoveManager(state, table)
+
+    slot = TileSlot.from_effective(color=0, value=9)
+    replaced, recovered, reason = manager.try_replace_joker_in_target(slot, ("group", 0, 8))
+
+    assert reason == ""
+    assert replaced
+    assert recovered is not None
+    assert recovered.tile_id == JOKER_ID
+    meld = manager.edited_table.melds[0]
+    assert all(s.tile_id != JOKER_ID for s in meld.slots)
+
+
+def test_non_touching_run_creates_new_meld():
+    state = _state_with_opening_done()
+    table = Table([Meld.from_effective_run(color=0, start=1, length=3)])
+    manager = DraftMoveManager(state, table)
+
+    slot = TileSlot.from_effective(color=0, value=9)
+    ok, reason = manager.insert_slot_into_target(slot, ("run", 0, -1))
+
+    assert ok, reason
+    assert len(manager.edited_table.melds) == 2
+    assert len(manager.edited_table.melds[1].slots) == 1
