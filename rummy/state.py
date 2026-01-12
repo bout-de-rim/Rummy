@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
@@ -53,16 +54,13 @@ class GameState:
             self.deck_index,
             self.turn_number,
             tuple(tuple(h.counts) for h in self.hands),
-            tuple(
-                (
-                    meld.kind.value,
-                    tuple(slot.signature() for slot in meld.slots),
-                )
-                for meld in self.table.canonicalize().melds
-            ),
+            self.table.canonical_key(),
             tuple(self.initial_meld_done),
             self.winner,
         )
+
+    def stable_hash(self) -> str:
+        return hashlib.sha256(repr(self.state_key()).encode("utf-8")).hexdigest()
 
 
 def _deal_initial_hands(deck: List[int], ruleset: Ruleset, rng: random.Random) -> Tuple[List[TileMultiset], int, List[int]]:
