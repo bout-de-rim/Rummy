@@ -67,7 +67,7 @@ def test_replay_is_deterministic():
     base_state = new_game(ruleset=rules, rng_seed=123)
     state = base_state
     state = apply_move(state, Move.draw())
-    state = apply_move(state, Move.skip())
+    state = apply_move(state, Move.draw())
 
     replayed = replay_event_log(base_state, state.event_log)
     assert replayed.state_key() == state.state_key()

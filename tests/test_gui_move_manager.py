@@ -1,0 +1,234 @@
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from rummy.gui import DraftMoveManager
+from rummy.meld import Meld, MeldKind
+from rummy.rules import Ruleset
+from rummy.state import new_game
+from rummy.table import Table
+from rummy.tiles import JOKER_ID, TileSlot
+
+
+def _table_signature(table: Table):
+    return [m.effective_signature() for m in table.canonicalize().melds]
+
+
+def _find_slot(manager: DraftMoveManager, tile_id: int) -> tuple[int, int]:
+    for meld_idx, meld in enumerate(manager.edited_table.melds):
+        for slot_idx, slot in enumerate(meld.slots):
+            if slot.tile_id == tile_id:
+                return meld_idx, slot_idx
+    raise AssertionError(f"Tile {tile_id} not found on table")
+
+
+def _state_with_opening_done() -> Ruleset:
+    rules = Ruleset(initial_hand_size=0, initial_meld_min_points=0)
+    state = new_game(ruleset=rules, rng_seed=1)
+    state.initial_meld_done[state.current_player] = True
+    return state
+
+
+def test_run_insert_extends_without_joker():
+    state = _state_with_opening_done()
+    table = Table([Meld.from_effective_run(color=0, start=1, length=3)])
+    manager = DraftMoveManager(state, table)
+
+    slot = TileSlot.from_effective(color=0, value=4)
+    ok, reason = manager.insert_slot_into_target(slot, ("run", 0, -1))
+
+    assert ok, reason
+    assert len(manager.edited_table.melds) == 1
+    meld = manager.edited_table.melds[0]
+    valid, reason = meld.is_valid()
+    assert valid, reason
+    assert len(meld.slots) == 4
+
+
+def test_run_insert_joker_bridges_runs():
+    state = _state_with_opening_done()
+    table = Table(
+        [
+            Meld.from_effective_run(color=0, start=1, length=2),
+            Meld.from_effective_run(color=0, start=4, length=2),
+        ]
+    )
+    manager = DraftMoveManager(state, table, hand_joker_value=1)
+
+    slot = TileSlot(JOKER_ID, assigned_color=None, assigned_value=None)
+    ok, reason = manager.insert_slot_into_target(slot, ("run", 0, -1))
+
+    assert ok, reason
+    assert len(manager.edited_table.melds) == 1
+    meld = manager.edited_table.melds[0]
+    valid, reason = meld.is_valid()
+    assert valid, reason
+    joker_slots = [s for s in meld.slots if s.tile_id == JOKER_ID]
+    assert joker_slots
+    assert joker_slots[0].assigned_color == 0
+    assert joker_slots[0].assigned_value == 3
+
+
+def test_group_insert_joker_selects_missing_color():
+    state = _state_with_opening_done()
+    table = Table([Meld.from_effective_group(value=7, colors=[0, 1])])
+    manager = DraftMoveManager(state, table)
+
+    slot = TileSlot(JOKER_ID, assigned_color=None, assigned_value=None)
+    slot = manager.adapt_slot_for_target(slot, ("group", 0, 6))
+    ok, reason = manager.insert_slot_into_target(slot, ("group", 0, 6))
+
+    assert ok, reason
+    meld = manager.edited_table.melds[0]
+    valid, reason = meld.is_valid()
+    assert valid, reason
+    joker_slots = [s for s in meld.slots if s.tile_id == JOKER_ID]
+    assert joker_slots
+    assert joker_slots[0].assigned_value == 7
+    assert joker_slots[0].assigned_color == 2
+
+
+def test_opening_blocks_existing_group_insert():
+    rules = Ruleset(initial_hand_size=0, initial_meld_min_points=30)
+    state = new_game(ruleset=rules, rng_seed=2)
+    table = Table([Meld.from_effective_group(value=5, colors=[0, 1, 2])])
+    state.table = table
+    manager = DraftMoveManager(state, table)
+    original = _table_signature(manager.edited_table)
+
+    slot = TileSlot.from_effective(color=3, value=5)
+    ok, reason = manager.insert_slot_into_target(slot, ("group", 0, 4))
+
+    assert not ok
+    assert "ouverture" in reason
+    assert _table_signature(manager.edited_table) == original
+
+
+def test_move_table_slot_rolls_back_on_invalid_drop():
+    state = _state_with_opening_done()
+    table = Table(
+        [
+            Meld.from_effective_run(color=0, start=1, length=3),
+            Meld.from_effective_group(value=5, colors=[0, 1, 2]),
+        ]
+    )
+    manager = DraftMoveManager(state, table)
+    original = _table_signature(manager.edited_table)
+
+    ok, reason = manager.move_table_slot(0, 1, ("group", 0, 4))
+
+    assert not ok
+    assert "Déplacement refusé" in reason
+    assert _table_signature(manager.edited_table) == original
+
+
+def test_drag_drop_roundtrip_restores_table():
+    state = _state_with_opening_done()
+    table = Table(
+        [
+            Meld.from_effective_run(color=0, start=1, length=3),
+            Meld.from_effective_group(value=3, colors=[1, 2, 3]),
+        ]
+    )
+    manager = DraftMoveManager(state, table)
+    original = _table_signature(manager.edited_table)
+
+    meld_idx, slot_idx = _find_slot(manager, tile_id=2)
+    ok, reason = manager.move_table_slot(meld_idx, slot_idx, ("group", 0, 2))
+    assert ok, reason
+
+    meld_idx, slot_idx = _find_slot(manager, tile_id=2)
+    ok, reason = manager.move_table_slot(meld_idx, slot_idx, ("run", 0, -1))
+    assert ok, reason
+
+    assert _table_signature(manager.edited_table) == original
+
+
+def test_drag_drop_joker_roundtrip_restores_table():
+    state = _state_with_opening_done()
+    group_a = Meld(
+        kind=MeldKind.GROUP,
+        slots=[
+            TileSlot.from_effective(color=0, value=7, use_joker=True),
+            TileSlot.from_effective(color=1, value=7),
+            TileSlot.from_effective(color=2, value=7),
+        ],
+    )
+    group_b = Meld(
+        kind=MeldKind.GROUP,
+        slots=[TileSlot.from_effective(color=3, value=7)],
+    )
+    table = Table([group_a, group_b])
+    manager = DraftMoveManager(state, table)
+    original = _table_signature(manager.edited_table)
+
+    meld_idx, slot_idx = _find_slot(manager, tile_id=JOKER_ID)
+    ok, reason = manager.move_table_slot(meld_idx, slot_idx, ("group", 1, 6))
+    assert ok, reason
+
+    meld_idx, slot_idx = _find_slot(manager, tile_id=JOKER_ID)
+    ok, reason = manager.move_table_slot(meld_idx, slot_idx, ("group", 0, 6))
+    assert ok, reason
+
+    assert _table_signature(manager.edited_table) == original
+
+
+def test_replace_joker_in_run_recovers():
+    state = _state_with_opening_done()
+    run_slots = [
+        TileSlot.from_effective(color=0, value=1),
+        TileSlot.from_effective(color=0, value=2),
+        TileSlot.from_effective(color=0, value=3, use_joker=True),
+    ]
+    table = Table([Meld(kind=MeldKind.RUN, slots=run_slots)])
+    manager = DraftMoveManager(state, table)
+
+    slot = TileSlot.from_effective(color=0, value=3)
+    replaced, recovered, reason = manager.try_replace_joker_in_target(slot, ("run", 0, -1))
+
+    assert reason == ""
+    assert replaced
+    assert recovered is not None
+    assert recovered.tile_id == JOKER_ID
+    meld = manager.edited_table.melds[0]
+    assert all(s.tile_id != JOKER_ID for s in meld.slots)
+
+
+def test_replace_joker_in_group_recovers():
+    state = _state_with_opening_done()
+    group = Meld(
+        kind=MeldKind.GROUP,
+        slots=[
+            TileSlot.from_effective(color=0, value=9, use_joker=True),
+            TileSlot.from_effective(color=1, value=9),
+            TileSlot.from_effective(color=2, value=9),
+        ],
+    )
+    table = Table([group])
+    manager = DraftMoveManager(state, table)
+
+    slot = TileSlot.from_effective(color=0, value=9)
+    replaced, recovered, reason = manager.try_replace_joker_in_target(slot, ("group", 0, 8))
+
+    assert reason == ""
+    assert replaced
+    assert recovered is not None
+    assert recovered.tile_id == JOKER_ID
+    meld = manager.edited_table.melds[0]
+    assert all(s.tile_id != JOKER_ID for s in meld.slots)
+
+
+def test_non_touching_run_creates_new_meld():
+    state = _state_with_opening_done()
+    table = Table([Meld.from_effective_run(color=0, start=1, length=3)])
+    manager = DraftMoveManager(state, table)
+
+    slot = TileSlot.from_effective(color=0, value=9)
+    ok, reason = manager.insert_slot_into_target(slot, ("run", 0, -1))
+
+    assert ok, reason
+    assert len(manager.edited_table.melds) == 2
+    assert len(manager.edited_table.melds[1].slots) == 1
